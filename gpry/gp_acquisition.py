@@ -9,7 +9,7 @@ from gpry.acquisition_functions import is_acquisition_function
 from gpry.proposal import PartialProposer, CentroidsProposer
 from gpry.mpi import mpi_comm, mpi_rank, is_main_process, \
     split_number_for_parallel_processes, multi_gather_array
-from gpry.tools import check_random_state
+from gpry.tools import check_random_state, NumpyErrorHandling
 
 
 class GPAcquisition(object):
@@ -455,6 +455,452 @@ class GPAcquisition(object):
                                   "Excluding this.")
                 return True
         return False
+
+
+class Griffins(GPAcquisition):
+    """
+    Run Gaussian Process acquisition with Griffins.
+
+    Uses krigging believer while it samples the acquisition function using nested
+    sampling (with PolyChord).
+
+    Parameters
+    ----------
+    bounds : array
+        Bounds in which to optimize the acquisition function,
+        assumed to be of shape (d,2) for d dimensional prior
+
+    acq_func : GPry Acquisition Function, optional (default: "LogExp")
+        Acquisition function to maximize/minimize. If none is given the
+        `LogExp` acquisition function will be used
+
+    random_state : int or numpy.RandomState, optional
+        The generator used to initialize the centers. If an integer is
+        given, it fixes the seed. Defaults to the global numpy random
+        number generator.
+
+    zeta_scaling : float, optional (default: 1.1)
+        The scaling of the acquisition function's zeta parameter with dimensionality
+        (Only if "LogExp" is passed as acquisition_function)
+
+    zeta: float, optional (default: None, uses zeta_scaling)
+        Specifies the value of the zeta parameter directly.
+
+    nlive_per_training: int
+        live points per sample in the current training set.
+        Not recommended to decrease it.
+
+    nlive_per_dim_min: int
+        live points min cap (times dimension).
+
+    num_repeats_per_dim: int
+        length of slice-chains times dimension.
+
+    precision_criterion_target: float
+        Cap on precision criterion of PolyChord.
+
+    nprior_per_nlive: int
+        Number of initial samples times dimension.
+
+    preprocessing_X : X-preprocessor, Pipeline_X, optional (default: None)
+        Single preprocessor or pipeline of preprocessors for X. Preprocessing
+        makes sense if the scales along the different dimensions are vastly
+        different which means that the optimizer struggles to find the maximum
+        of the acquisition function. If None is passed the data is not
+        preprocessed.
+
+    verbose : 1, 2, 3, optional (default: 1)
+        Level of verbosity. 3 prints Infos, Warnings and Errors, 2
+        Warnings and Errors, and 1 only Errors. Should be set to 2 or 3 if
+        problems arise.
+
+    Attributes
+    ----------
+    gpr_ : GaussianProcessRegressor
+            The GP Regressor which is currently used for optimization.
+
+    """
+
+    def __init__(self, bounds,
+                 acq_func="LogExp",
+                 preprocessing_X=None,
+                 random_state=None,
+                 zeta_scaling=0.85,
+                 zeta=None,
+                 nlive_per_training=3,
+                 nlive_per_dim_min=40,
+                 num_repeats_per_dim=8,
+                 precision_criterion_target=0.005,
+                 nprior_per_nlive=25,
+                 verbose=1):
+        try:
+            # pylint: disable=import-outside-toplevel
+            from pypolychord.settings import PolyChordSettings
+            from pypolychord.priors import UniformPrior
+        except ImportError as excpt:
+            raise ImportError(
+                "PolyChord needs to be installed to use this acquirer.") from excpt
+        self.bounds = np.array(bounds)
+        self.n_d = np.shape(bounds)[0]
+        self.preprocessing_X = preprocessing_X
+        self.verbose = verbose
+        if is_acquisition_function(acq_func):
+            self.acq_func = acq_func
+        elif acq_func == "LogExp":
+            # If the LogExp acquisition function is chosen it's zeta is set
+            # automatically using the dimensionality of the prior.
+            self.acq_func = LogExp(
+                dimension=self.n_d, zeta=zeta, zeta_scaling=zeta_scaling)
+        elif acq_func == "NonlinearLogExp":
+            # If the LogExp acquisition function is chosen it's zeta is set
+            # automatically using the dimensionality of the prior.
+            self.acq_func = NonlinearLogExp(
+                dimension=self.n_d, zeta=zeta, zeta_scaling=zeta_scaling)
+        else:
+            raise TypeError("acq_func needs to be an Acquisition_Function or "
+                            f"'LogExp' or 'NonlinearLogExp', instead got {acq_func}")
+        # Configure nested sampler
+        self.polychord_settings = PolyChordSettings(nDims=self.n_d, nDerived=0)
+        # Don't write unnecessary files: take lots of space and waste time
+        self.polychord_settings.read_resume = False
+        self.polychord_settings.write_resume = False
+        self.polychord_settings.write_live = False
+        self.polychord_settings.write_dead = False
+        self.polychord_settings.write_prior = False
+        self.polychord_settings.feedback = verbose
+        # Using rng state as seed for PolyChord
+        if random_state is not None:
+            self.polychord_settings.seed = \
+                random_state.bit_generator.state["state"]["state"] + mpi_rank
+        # Prepare precision parameters
+        self.nlive_per_training = nlive_per_training
+        self.nlive_per_dim_min = nlive_per_dim_min
+        self.num_repeats_per_dim = num_repeats_per_dim
+        self.precision_criterion_target = precision_criterion_target
+        self.nprior_per_nlive = nprior_per_nlive
+        self.prior = UniformPrior(*self.bounds.T)
+        # Pools for storing intermediate results during parallelised acquisition
+        self.pool_X = None
+        self.pool_Y = None
+        self.pool_log_acq = None
+        self.pool_gpr = None
+        self.last_polychord_output = None
+
+    @property
+    def pool_size(self):
+        """Size of the pool of points."""
+        if self.pool_X is not None:
+            return self.pool_X.shape[0] - 1
+        return None
+
+    def update_NS_precision(self, gpr):
+        """
+        Updates NS (PolyChord) precision parameters:
+        - num_repeats: constant for now
+        - nlive: `nlive_per_training` times the size of the training set, capped at
+            `nlive_per_dim_cap` (typically 25) times the dimension.
+        - precision_criterion: takes a line that passes through some
+            (log_max_preccrit, max_logKL) and some (log_min_preccrit, min_logKL)
+            and interpolates for the exponential running mean of the logKL's
+        """
+        self.polychord_settings.nlive = min(
+            self.nlive_per_training * gpr.n,
+            self.nlive_per_dim_min * self.n_d)
+        self.polychord_settings.num_repeats = self.num_repeats_per_dim * self.n_d
+        self.polychord_settings.precision_criterion = self.precision_criterion_target
+        self.polychord_settings.nprior = \
+            int(self.nprior_per_nlive * self.polychord_settings.nlive)
+
+    def log(self, msg, level=None):
+        """
+        Print a message if its verbosity level is equal or lower than the given one (or
+        always if ``level=None``.
+        """
+        if level is None or level <= self.verbose:
+            print(msg)
+
+    def multi_add(self, gpr, n_points=1, random_state=None):
+        r"""Method to query multiple points where the objective function
+        shall be evaluated.
+
+        The strategy which is used to query multiple points is by using
+        the :math:`f(x)\sim \mu(x)` strategy and and not changing the
+        hyperparameters of the model.
+
+        It runs PolyChord on the mean of the GP model, tracking the value
+        of the acquisition function at every evaluation, and keeping a
+        pool of candidates which is re-sorted whenever a new good candidate
+        is found.
+
+        When run in parallel (MPI), returns the same values for all processes.
+
+        Parameters
+        ----------
+        gpr : GaussianProcessRegressor
+            The GP Regressor which is used as surrogate model.
+
+        n_points : int, optional (default=1)
+            Number of points returned by the optimize method
+            If the value is 1, a single point to evaluate is returned.
+
+            Otherwise a list of points to evaluate is returned of size
+            n_points. This is useful if you can evaluate your objective
+            in parallel, and thus obtain more objective function evaluations
+            per unit of time.
+
+        random_state : int or numpy.RandomState, optional
+            The generator used to initialize the centers. If an integer is
+            given, it fixes the seed. Defaults to the global numpy random
+            number generator.
+
+        Returns
+        -------
+        X : numpy.ndarray, shape = (X_dim, n_points)
+            The X values of the found optima
+        y_lies : numpy.ndarray, shape = (n_points,)
+            The predicted values of the GP at the proposed sampling locations
+        fval : numpy.ndarray, shape = (n_points,)
+            The values of the acquisition function at X_opt
+        """
+        # Reset pool of points to be computed
+        # The size of the pool should be AT least the amount of points to be acquired.
+        # If running several processes in paraller, it can be reduced down to the number
+        #   of points to be evaluated per process, but with less guarantee to find an
+        #   optimal set.
+        self.pool_X = np.zeros((n_points + 1, gpr.d))
+        self.pool_Y = np.zeros((n_points + 1))
+        self.pool_log_acq = np.full((n_points + 1), np.nan)
+        self.pool_gpr = (n_points - 1) * [None]
+        # Update PolyChord precision settings
+        self.update_NS_precision(gpr)
+        # Check if n_points is positive and an integer
+        if not (isinstance(n_points, int) and n_points > 0):
+            raise ValueError(f"n_points should be int > 0, got {n_points}")
+
+        # Initialise "likelihood" -- returns GPR value and deals with pooling/ranking
+        def logp(X):
+            """
+            Returns the predicted value at a given point (-inf if prior=0).
+            """
+            X = np.atleast_2d(X)
+            logp_pred, sigma_pred = gpr.predict(X, return_std=True, do_check_array=False)
+            self.add_to_pool(X, logp_pred[0], sigma_pred[0], gpr=gpr)
+            return logp_pred[0], []
+
+        from pypolychord import run_polychord  # pylint: disable=import-outside-toplevel
+        with NumpyErrorHandling(all="ignore") as _:
+            self.last_polychord_output = run_polychord(
+                logp,
+                nDims=self.n_d, nDerived=0,
+                settings=self.polychord_settings,
+                prior=self.prior)
+        return self.get_optimal_locations(n_points)
+
+    def get_optimal_locations(self, n_points):
+        """
+        Merges the pools of parallel processes to find ``n_points`` optimal locations.
+
+        Returns all these locations for all processes.
+        """
+        # Gather all pools
+        pool_X = mpi_comm.gather(self.pool_X, root=0)
+        pool_Y = mpi_comm.gather(self.pool_Y, root=0)
+        pool_log_acq = mpi_comm.gather(self.pool_log_acq, root=0)
+        if is_main_process:
+            # Mind the nan's:
+            # PolyChord only evaluates once in rank=0 if >1 MPI processes
+            pool_log_acq = np.concatenate(pool_log_acq)
+            i_notnan = np.invert(np.isnan(pool_log_acq))
+            pool_log_acq = pool_log_acq[i_notnan]
+            pool_X = np.concatenate(pool_X)[i_notnan]
+            pool_Y = np.concatenate(pool_Y)[i_notnan]
+            # Since the order in which the points are added has some
+            # influence on the final selection, do a naive sorting first
+            i_sort = np.argsort(pool_log_acq)[::-1]
+            pool_log_acq = pool_log_acq[i_sort]
+            pool_X = pool_X[i_sort]
+            pool_Y = pool_Y[i_sort]
+            # Now sort up to pool_size = n_points
+            # (First add the points from other ranks fro the pool of the main process)
+            for i in range(len(pool_log_acq)):
+                if pool_X[i] in self.pool_X:
+                    continue
+                # This sorts the pool at every step
+                self.add_to_pool(pool_X[i], pool_Y[i])
+        return mpi_comm.bcast(
+            (pool_X[:n_points], pool_Y[:n_points], pool_log_acq[:n_points])
+            if is_main_process else (None, None, None))
+
+    def add_to_pool(self, X, logp_pred, sigma_pred=None, gpr=None):
+        """
+        Tries to add one point to the pool:
+        1. Computes its log-acquisition function value
+           (If the pools is not full, just adds it and sorts)
+        2. Finds its position in the list
+        3. Adds it to the list in the correct position and re-sorts
+        """
+        # 1. Compute log-acquisition and go on only if finite
+        if sigma_pred is None:
+            raise NotImplementedError("Trivial, did not have time.")
+        log_acq = self.acq_func.f(logp_pred, sigma_pred, self.acq_func.zeta)
+        if not np.isfinite(log_acq):
+            self.log(
+                level=4, msg="[pool-add] Got -inf log-acquisition: ignoring point.")
+            return
+        if self.verbose >= 4:
+            self.log(f"[pool-add] Checking point {X} with logp_pred = "
+                     f"{logp_pred} +/- {sigma_pred}, log acq = {log_acq}",
+                     )
+        # (If the pool is not yet full (beginning of sampling), just add the point)
+        # Trick for fast nan check (since `np.nan in [array]` does not work)
+        pool_not_full = np.isnan(np.dot(self.pool_log_acq, self.pool_log_acq))
+        if pool_not_full:
+            self.log(level=4, msg="[pool-add] Still filling the pool")
+            i_nan = list(np.argwhere(np.isnan(self.pool_log_acq)).T[0])
+            self.pool_X[i_nan[0]] = X
+            self.pool_Y[i_nan[0]] = logp_pred
+            self.pool_log_acq[i_nan[0]] = log_acq
+            # First time the pool gets full: sort it!
+            if len(i_nan) == 1:
+                self.log(
+                    level=4,
+                    msg="[pool-add] The pool is full for the first time! (but unsorted)",
+                )
+                self.log_pool(level=4)
+                self.sort_pool(gpr)
+                self.log(level=4, msg="[pool-add] The first pool, sorted:")
+                self.log_pool(level=4)
+            return
+        # 2. Find its position in the list, conditioned to those on top
+        # Shortcut: start from the bottom, ignore last element (just a placeholder)
+        i_new_last = self.pool_size
+        while True:
+            try:
+                i_new = (self.pool_size -
+                         next(i for i in range(self.pool_size)
+                              if self.pool_log_acq[-(i + 2)] >= log_acq))
+            except StopIteration:
+                i_new = 0
+            self.log(level=4, msg=f"[pool-add] Position: {i_new + 1}")
+            if i_new in [0, i_new_last, self.pool_size]:
+                break
+            sigma_pred = self.pool_gpr[i_new - 1].predict(
+                X, return_std=True, do_check_array=False)[1][0]
+            log_acq_last = log_acq.copy()
+            log_acq = self.acq_func.f(logp_pred, sigma_pred, self.acq_func.zeta)
+            # New log-acquisition should not be higher than the old one, since the new one
+            # corresponds to a model with more training points (though fake ones).
+            # This may happen anyway bc numerical errors, e.g. when the correlation
+            # length is really huge. Also, when alpha or the noise level for two cached
+            # models are different. We can just ignore it.
+            # (Sometimes, it's just ~1e6 relative differences, which is not worrying)
+            if log_acq > log_acq_last:
+                log_acq = log_acq_last.copy()
+            self.log(
+                level=4, msg="[pool-add] --> updated log-acquisition: %e" % log_acq)
+            i_new_last = i_new
+        self.log(level=4, msg="[pool-add] Final position: %d (of %d + 1)" %
+                 (i_new + 1, self.pool_size))
+        # The final position is just a place-holder: don't save it if it falls there.
+        if i_new >= self.pool_size:
+            self.log(level=4, msg="[pool-add] Discarded!")
+            return
+        if self.verbose >= 4:
+            self.log(level=4, msg="[pool-add] Adding point: %r logp: %e ; log_acq: %e" %
+                     (X, logp_pred, log_acq))
+        # Insert the new one in its place, and push the rest one place down
+        for pool, value in [(self.pool_X, X), (self.pool_Y, logp_pred)]:
+            pool[i_new + 1:] = pool[i_new:-1]
+            pool[i_new] = value
+        # (Next line is useless, just there for debugging)
+        self.pool_log_acq[i_new + 1:] = self.pool_log_acq[i_new: -1]
+        self.pool_log_acq[i_new] = log_acq
+        # 3. For the sub-list below the new element: update log-acquisitions and sort
+        if i_new < self.pool_size - 1:
+            if self.verbose >= 4:
+                self.log(
+                    level=4,
+                    msg=("[pool-add] Caching newly added model, with log-acquisition: "
+                         "{log_acq}")
+                )
+            if self.pool_log_acq[i_new] > -np.inf:
+                self.cache_model(i_new, gpr)
+            sigmas_pred = self.pool_gpr[i_new].predict(
+                self.pool_X[i_new + 1:], return_std=True)[1]
+            self.pool_log_acq[i_new + 1:] = np.array(
+                [self.acq_func.f(mu, s, self.acq_func.zeta)
+                 for mu, s in zip(self.pool_Y[i_new + 1:], sigmas_pred)])
+        self.sort_pool(gpr, i_start=i_new + 1)
+        self.log(level=4, msg="[pool-add] The new pool, sorted:")
+        self.log_pool(level=4)
+        return
+
+    def sort_pool(self, gpr, i_start=0):
+        """
+        Sorts in descending order of info gain, where the log_acq of
+        the i-th element is conditioned on the GRF model that includes
+        the points with j<i with their predicted (mean) logposterior.
+
+        If `i_start`!=0 is given, assumes the <i elements in the list
+        are already sorted following this criterion, and in particular
+        that all info gains take into account the first `i_start` points.
+        """
+        self.log(
+            level=4,
+            msg=f"[pool-sort] Sorting the pool starting at position {i_start + 1}",
+        )
+        for i_this in range(i_start, self.pool_size):
+            # find next best point, and move it to next slot
+            i_new = i_this + np.argmax(self.pool_log_acq[i_this:])
+            self.log(
+                level=4,
+                msg=f"[pool-sort] Swapping positions {i_this + 1} and {i_new + 1}",
+            )
+            self.pool_X[[i_this, i_new]] = self.pool_X[[i_new, i_this]]
+            self.pool_Y[[i_this, i_new]] = self.pool_Y[[i_new, i_this]]
+            self.pool_log_acq[i_this] = self.pool_log_acq[i_new]
+            # If the max found was -inf, then fill all -inf with nans and stop sorting
+            # (nan means that that point in the pool is empty)
+            if self.pool_log_acq[i_this] == -np.inf and i_this < self.pool_size - 1:
+                i_inf_pool = list(np.argwhere(
+                    np.isinf(self.pool_log_acq)).T[0])
+                self.pool_log_acq[i_inf_pool] = np.nan
+                break
+            # Update model and recompute info gains below it
+            if i_this < self.pool_size - 1:
+                if self.verbose >= 4:
+                    self.log(
+                        level=4,
+                        msg=("[pool-sort] Caching model with info gain: "
+                             f"{self.pool_log_acq[i_this]}"),
+                    )
+                if self.pool_log_acq[i_this] > -np.inf:
+                    self.cache_model(i_this, gpr)
+                sigmas_pred = self.pool_gpr[i_this].predict(
+                    self.pool_X[i_this + 1:], return_std=True, do_check_array=False)[1]
+                self.pool_log_acq[i_this + 1:] = np.array([
+                    self.acq_func.f(mu, s, self.acq_func.zeta)
+                    for mu, s in zip(self.pool_Y[i_this + 1:], sigmas_pred)])
+
+    def cache_model(self, i, gpr):
+        """
+        Cache the GP model that contains the training set
+        plus the pool points up to position ``i``, with predicted dummy logp.
+        """
+        self.pool_gpr[i] = deepcopy(gpr)
+        # NB: old code contains a loop to increasingly add noise during this "fit"
+        #     if needed (doesn't matter too much in an augmented model)
+        self.pool_gpr[i].append_to_data(
+            self.pool_X[:i + 1], self.pool_Y[:i + 1], fit=False)
+
+    def log_pool(self, level=4):
+        """Prints the current pools."""
+        if self.verbose < level:
+            return
+        for i in range(len(self.pool_X) - 1):
+            self.log(level=level, msg=(
+                "%d : %r ; logp = %g ; loginfo = %g" %
+                (i + 1, self.pool_X[i], self.pool_Y[i], self.pool_log_acq[i])))
 
 
 # DEPRECATED ON 2022-08-01
