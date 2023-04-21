@@ -1,7 +1,8 @@
 import warnings
+from copy import deepcopy
+from functools import partial
 import numpy as np
 import scipy.optimize
-from copy import deepcopy
 from sklearn.base import is_regressor
 
 from gpry.acquisition_functions import LogExp, NonlinearLogExp
@@ -559,6 +560,7 @@ class Griffins(GPAcquisition):
         else:
             raise TypeError("acq_func needs to be an Acquisition_Function or "
                             f"'LogExp' or 'NonlinearLogExp', instead got {acq_func}")
+        self.acq_func_y_sigma = partial(self.acq_func.f, zeta=self.acq_func.zeta)
         # Configure nested sampler
         self.polychord_settings = PolyChordSettings(nDims=self.n_d, nDerived=0)
         # Don't write unnecessary files: take lots of space and waste time
@@ -664,7 +666,7 @@ class Griffins(GPAcquisition):
         # If running several processes in parallel, it can be reduced down to the number
         #   of points to be evaluated per process, but with less guarantee to find an
         #   optimal set.
-        self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func)
+        self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma)
         # Update PolyChord precision settings
         self.update_NS_precision(gpr)
         # Check if n_points is positive and an integer
@@ -723,7 +725,7 @@ class Griffins(GPAcquisition):
         if is_main_process:
             self.pool.add(pool_X, pool_y, pool_sigma)
         pool = mpi_comm.bcast(self.pool)
-        pool_acq = self.acq_func(pool.y[:n_points], pool.sigma[:n_points])
+        pool_acq = self.acq_func_y_sigma(pool.y[:n_points], pool.sigma[:n_points])
         return pool.X[:n_points], pool.y[:n_points], pool_acq
 
 
@@ -850,7 +852,8 @@ class RankedPool():
             Value of the acquisition function.
         """
         if y is None:
-            y, sigma = self._gpr.predict(X, return_std=True, do_check_array=False)
+            y, sigma = self._gpr.predict(
+                np.atleast_2d(X), return_std=True, do_check_array=False)
             y, sigma = y[0], sigma[0]
         if acq is None:
             acq = self._acq_func(y, sigma)
@@ -901,7 +904,7 @@ class RankedPool():
                 break
             # Otherwise, compute conditioned acquisition value, using point above; re-rank
             sigma_cond = self.gpr[i_new - 1].predict(
-                X, return_std=True, do_check_array=False)[1][0]
+                np.atleast_2d(X), return_std=True, do_check_array=False)[1][0]
             # New acquisition should not be higher than the old one, since the new one
             # corresponds to a model with more training points (though fake ones).
             # This may happen anyway bc numerical errors, e.g. when the correlation
@@ -911,7 +914,7 @@ class RankedPool():
             acq_cond = min(acq_cond, self._acq_func(y, sigma_cond))
             self.log(
                 level=4,
-                msg=f"[pool.add] --> updated conditional acquisition: {acq_cond:e}")
+                msg=f"[pool.add] --> updated conditional acquisition: {acq_cond}")
             i_new_last = i_new
         # The final position is just a place-holder: don't save it if it falls there.
         if i_new >= len(self):
