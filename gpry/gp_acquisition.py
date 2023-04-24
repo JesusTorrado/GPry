@@ -661,17 +661,15 @@ class Griffins(GPAcquisition):
         fval : numpy.ndarray, shape = (n_points,)
             The values of the acquisition function at X_opt
         """
+        # Check if n_points is positive and an integer
+        if not (isinstance(n_points, int) and n_points > 0):
+            raise ValueError(f"n_points should be int > 0, got {n_points}")
         # Reset pool of points to be computed
         # The size of the pool should be at least the amount of points to be acquired.
         # If running several processes in parallel, it can be reduced down to the number
         #   of points to be evaluated per process, but with less guarantee to find an
         #   optimal set.
         self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma)
-        # Update PolyChord precision settings
-        self.update_NS_precision(gpr)
-        # Check if n_points is positive and an integer
-        if not (isinstance(n_points, int) and n_points > 0):
-            raise ValueError(f"n_points should be int > 0, got {n_points}")
 
         # Initialise "likelihood" -- returns GPR value and deals with pooling/ranking
         def logp(X):
@@ -680,9 +678,12 @@ class Griffins(GPAcquisition):
             """
             X = np.atleast_2d(X)
             logp_pred, sigma_pred = gpr.predict(X, return_std=True, do_check_array=False)
-            self.pool.add_one(X, logp_pred[0], sigma_pred[0])
+            if sigma_pred[0] > 0:
+                self.pool.add_one(X, logp_pred[0], sigma_pred[0])
             return logp_pred[0], []
 
+        # Update PolyChord precision settings
+        self.update_NS_precision(gpr)
         from pypolychord import run_polychord  # pylint: disable=import-outside-toplevel
         with NumpyErrorHandling(all="ignore") as _:
             self.last_polychord_output = run_polychord(
@@ -776,11 +777,11 @@ class RankedPool():
         """Retuns a standardised string to log a point."""
         return f"{X}, y = {y} +/- {sigma}; acq = {acq}"
 
-    def log_pool(self, level=4):
+    def log_pool(self, level=4, include_last=False):
         """Prints the current pools."""
         if self.verbose < level:
             return
-        for i in range(len(self.X) - 1):
+        for i in range(len(self.X) + (-1 if not include_last else 0)):
             self.log(level=level,
                      msg=(f"{i + 1} : " + self.str_point(
                          self.X[i], self.y[i], self.sigma[i], self.acq[i])))
@@ -882,7 +883,7 @@ class RankedPool():
                     level=4,
                     msg="[pool.add] The pool is full for the first time! (but unsorted)",
                 )
-                self.log_pool(level=4)
+                self.log_pool(level=4, include_last=True)
                 self.sort()
                 self.log(level=4, msg="[pool.add] The first pool, sorted:")
                 self.log_pool(level=4)
@@ -898,7 +899,7 @@ class RankedPool():
                               if self.acq[-(i + 2)] >= acq_cond))
             except StopIteration:  # top of the list reached
                 i_new = 0
-            self.log(level=4, msg=f"[pool.add] Provsional position: {i_new + 1}")
+            self.log(level=4, msg=f"[pool.add] Provisional position: [{i_new + 1}]")
             # top, same as last or last: final ranking reached
             if i_new in [0, i_new_last, len(self)]:
                 break
@@ -911,16 +912,16 @@ class RankedPool():
             # length is really huge. Also, when alpha or the noise level for two cached
             # models are different. We can just ignore it.
             # (Sometimes, it's just ~1e6 relative differences, which is not worrying)
-            acq_cond = min(acq_cond, self._acq_func(y, sigma_cond))
+            self.acq[i_new] = min(acq_cond, self._acq_func(y, sigma_cond))
             self.log(
                 level=4,
-                msg=f"[pool.add] --> updated conditional acquisition: {acq_cond}")
+                msg=f"[pool.add] --> updated conditional acquisition: {self.acq[i_new]}")
             i_new_last = i_new
         # The final position is just a place-holder: don't save it if it falls there.
         if i_new >= len(self):
             self.log(level=4, msg="[pool.add] Discarded!")
             return
-        self.log(level=4, msg=f"[pool.add] Final position: {i_new + 1} of {len(self)}")
+        self.log(level=4, msg=f"[pool.add] Final position: [{i_new + 1}] of {len(self)}")
         # Insert the new one in its place, and push the rest one place down
         # But not for the acq values, which will be updated below
         for pool, value in [(self.X, X), (self.y, y)]:
@@ -962,7 +963,7 @@ class RankedPool():
         """
         self.log(
             level=4,
-            msg=f"[pool.sort] Sorting the pool starting at position {i_start + 1}",
+            msg=f"[pool.sort] Sorting the pool starting at [{i_start + 1}]",
         )
         for i_this in range(i_start, len(self)):
             # Find next best point, and move it to next slot
@@ -974,13 +975,14 @@ class RankedPool():
             if self.acq[i_new_max] == -np.inf:
                 self.acq[i_this:] = np.nan
                 break
-            self.log(
-                level=4,
-                msg=f"[pool.sort] Swapping positions {i_this + 1} and {i_new_max + 1}",
-            )
-            self.X[[i_this, i_new_max]] = self.X[[i_new_max, i_this]]
-            self.y[[i_this, i_new_max]] = self.y[[i_new_max, i_this]]
-            self.acq[i_this] = self.acq[i_new_max]
+            if i_this != i_new_max:
+                self.log(
+                    level=4,
+                    msg=f"[pool.sort] Swapping [{i_this + 1}] and [{i_new_max + 1}]",
+                )
+                self.X[[i_this, i_new_max]] = self.X[[i_new_max, i_this]]
+                self.y[[i_this, i_new_max]] = self.y[[i_new_max, i_this]]
+                self.acq[i_this] = self.acq[i_new_max]
             # Update model and recompute acq values below it
             if i_this < len(self) - 1:
                 self.cache_model(i_this)
