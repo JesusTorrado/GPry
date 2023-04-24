@@ -174,6 +174,7 @@ class Runner(object):
                  callback_is_MPI_aware=False, convergence_options=None, options={},
                  initial_proposer="reference",
                  checkpoint=None, load_checkpoint=None, seed=None, plots=True, verbose=3):
+        self.verbose = verbose
         if model is None:
             if not (checkpoint is not None and str(load_checkpoint).lower() == "resume"):
                 raise ValueError(
@@ -188,16 +189,10 @@ class Runner(object):
         self.checkpoint = checkpoint
         if self.checkpoint is not None:
             self.plots_path = os.path.join(self.checkpoint, _plots_path)
-            if is_main_process:
-                create_path(self.checkpoint, verbose=verbose >= 3)
-                if plots:
-                    create_path(self.plots_path, verbose=verbose >= 3)
         else:
             self.plots_path = _plots_path
-            if plots and is_main_process:
-                create_path(self.plots_path, verbose=verbose >= 3)
         self.plots = plots
-        self.verbose = verbose
+        self.ensure_paths(plots=self.plots)
         self.random_state = get_random_state(seed)
         if is_main_process:
             self.options = options
@@ -418,6 +413,16 @@ class Runner(object):
         """
         if level is None or level <= self.verbose:
             print(msg)
+
+    def ensure_paths(self, plots=True):
+        """
+        Creates paths for checkpoint and plots.
+        """
+        if is_main_process:
+            if self.checkpoint:
+                create_path(self.checkpoint, verbose=self.verbose >= 3)
+            if plots:
+                create_path(self.plots_path, verbose=self.verbose >= 3)
 
     @property
     def n_total_left(self):
@@ -777,6 +782,7 @@ class Runner(object):
         """
         if not is_main_process:
             return
+        self.ensure_paths(plots=True)
         import matplotlib.pyplot as plt
         self.progress.plot_timing(
             truth=False, save=os.path.join(self.plots_path, "timing.svg"))
@@ -859,6 +865,7 @@ class Runner(object):
         """
         if not is_main_process:
             return
+        self.ensure_paths(plots=True)
         from getdist.mcsamples import MCSamplesFromCobaya
         import getdist.plots as gdplt
         from gpry.plots import getdist_add_training
@@ -899,6 +906,7 @@ class Runner(object):
         """
         if not is_main_process:
             return
+        self.ensure_paths(plots=True)
         import matplotlib.pyplot as plt
         mean = sampler.products()["sample"].mean()
         covmat = sampler.products()["sample"].cov()
