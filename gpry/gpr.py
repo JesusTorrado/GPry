@@ -842,7 +842,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         return self
 
     def predict(self, X, return_std=False, return_cov=False,
-                return_mean_grad=False, return_std_grad=False, do_check_array=True):
+                return_mean_grad=False, return_std_grad=False, validate=True):
         """
         Predict output for X.
 
@@ -868,10 +868,11 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             Whether or not to return the gradient of the std.
             Only valid when X is a single point.
 
-        do_check_array : bool, default: True
-            If False, ``X`` is assumed to be correctly formatted, and no checks are
-            performed on it. Reduces overhead. Use only for repeated calls when the input
-            is programmatically generated to be correct at each stage.
+        validate : bool, default: True
+            If False, ``X`` is assumed to be correctly formatted (2-d float array, with
+            points as rows and dimensions/features as columns, C-contiguous), and no
+            checks are performed on it. Reduces overhead. Use only for repeated calls when
+            the input is programmatically generated to be correct at each stage.
 
         .. note::
 
@@ -950,7 +951,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             y_std_full = np.zeros(n_samples)  # std is zero when mu is -inf
             grad_mean_full = np.ones((n_samples, n_dims))
             grad_std_full = np.zeros((n_samples, n_dims))
-            finite = self.account_for_inf.predict(X)
+            finite = self.account_for_inf.predict(X, validate=validate)
             # If all values are infinite there's no point in running the
             # prediction through the GP
             if np.all(~finite):

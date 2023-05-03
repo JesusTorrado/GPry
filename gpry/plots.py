@@ -205,7 +205,7 @@ def _plot_2d_model_acquisition(gpr, acquisition, last_points=None, res=200):
     x = np.linspace(bounds[0][0], bounds[0][1], res)
     y = np.linspace(bounds[1][0], bounds[1][1], res)
     X, Y = np.meshgrid(x, y)
-    xx = np.vstack([X.reshape(X.size), Y.reshape(Y.size)]).T
+    xx = np.ascontiguousarray(np.vstack([X.reshape(X.size), Y.reshape(Y.size)]).T)
     model_mean = gpr.predict(xx)
     # TODO: maybe change this one below if __call__ method added to GP_acquisition
     acq_value = acquisition.acq_func(xx, gpr, eval_gradient=False)

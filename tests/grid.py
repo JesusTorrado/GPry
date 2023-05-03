@@ -1,9 +1,8 @@
 """
 Script to generate grids of gaussian models for different input parameter values.
 
-Run with arguments [dim N] to generate N runs per parameter value with dimension dim.
-
-Run with "plot" as a single argument to plot the results of a run.
+Run with arguments [dim N path] to generate N runs per parameter value with dimension dim,
+and save the results in "path".
 
 The grid is defined by a `generate_input` function, that provides a dict whose values are
 input arguments dicts for the Runner (except a model, which is generated separately), and
@@ -145,7 +144,7 @@ def generate(nruns, likelihood_generator, path=None):
 
 if __name__ == "__main__":
     # contains a list of values for grid_parameter
-    arg_err_msg = "Pass [dim N path] as arguments, or ['plot' path] as single argument."
+    arg_err_msg = "Pass [dim N_runs path] as arguments."
     if len(sys.argv[1:]) != 3:
         raise ValueError(arg_err_msg)
     try:
