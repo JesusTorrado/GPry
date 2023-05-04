@@ -32,13 +32,15 @@ model = get_model(info)
 # Plotting the likelihood
 from cobaya.sampler import get_sampler
 from cobaya.output import get_output
-sampler = get_sampler({"polychord": {"num_repeats": "10d"}}, model, get_output("images/truth_chains"))
+sampler = get_sampler({"polychord": {"num_repeats": "10d", "measure_speeds": False}}, model, get_output("images/truth_chains"))
 sampler.run()
-gdsample_truth = sampler.products(to_getdist=True)["sample"]
-import getdist.plots as gdplt
-gdplot = gdplt.get_subplot_plotter()
-gdplot.triangle_plot(gdsample_truth, list(info["params"]), filled=True)
-gdplot.export("images/truth.png")
+
+if is_main_process:
+    gdsample_truth = sampler.products(to_getdist=True)["sample"]
+    import getdist.plots as gdplt
+    gdplot = gdplt.get_subplot_plotter()
+    gdplot.triangle_plot(gdsample_truth, list(info["params"]), filled=True)
+    gdplot.export("images/truth.png")
 
 #############################################################
 
