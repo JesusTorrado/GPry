@@ -1000,7 +1000,7 @@ class BaseLogExp(AcquisitionFunction, metaclass=ABCMeta):
             return values
 
     def __repr__(self):
-        return "{0:.3f}".format(self.zeta)
+        return str(self.__class__) + "with zeta={0:.3f}".format(self.zeta)
 
 
 class LogExp(BaseLogExp):

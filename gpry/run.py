@@ -401,6 +401,8 @@ class Runner(object):
         self.current_iteration = 0
         self.has_run = False
         self.has_converged = False
+        self.mean = None
+        self.cov = None
 
     @property
     def d(self):
@@ -569,14 +571,23 @@ class Runner(object):
             sync_processes()
             # Add the newly evaluated truths to the GPR, and maye refit hyperparameters
             if is_main_process:
-                do_simplified_fit = (self.current_iteration % self.fit_full_every != \
-                                     self.fit_full_every - 1)
+                kwargs_append = {}
+                kwargs_append["simplified_fit"] = \
+                    (self.current_iteration % self.fit_full_every !=
+                     self.fit_full_every - 1)
+                if self.cov is not None:
+                    stds = np.sqrt(np.diag(self.cov))
+                    prior_bounds = self.model.prior.bounds(confidence_for_unbounded=0.99995)
+                    relative_stds = stds / (prior_bounds[:, 1] - prior_bounds[:, 0])
+                    new_bounds = np.array([relative_stds / 2,  relative_stds * 2]).T
+                    kwargs_append["hyperparameter_bounds"] = self.gpr.kernel_.bounds.copy()
+                    kwargs_append["hyperparameter_bounds"][1:] = np.log(new_bounds)
                 with TimerCounter(self.gpr) as timer_fit:
                     self.gpr.append_to_data(new_X, new_y,
-                                            fit=True, simplified_fit=do_simplified_fit)
+                                            fit=True, **kwargs_append)
                 self.progress.add_fit(timer_fit.time, timer_fit.evals_loglike)
             if is_main_process:
-                hyperparams_or_not = "*not* " if do_simplified_fit else ""
+                hyperparams_or_not = "*not* " if kwargs_append["simplified_fit"] else ""
                 self.log(f"[FIT] ({timer_fit.time:.2g} sec) Fitted GP model with new "
                          "acquired points, "
                          f"{hyperparams_or_not}including GPR hyperparameters. "
@@ -652,6 +663,8 @@ class Runner(object):
                          f"{self.convergence.last_value:.2g} (limit "
                          f"{self.convergence.thres[-1]:.2g}).", level=3)
             sync_processes()
+            # TODO: uncomment for mean and cov updates (cov would be used for corr.length)
+            # self.update_mean_cov()
             self.progress.mpi_sync()
             self.save_checkpoint()
             if is_main_process and self.plots:
@@ -776,6 +789,19 @@ class Runner(object):
         # Broadcast results
         self._share_gpr_from_main()
         self.progress.mpi_sync()
+
+    def update_mean_cov(self):
+        """
+        Updates and shares mean and cov if available, checking GPAcquisition first, and
+        Convergence second if not present in GPAcquisition.
+        """
+        for attr in ["mean", "cov"]:
+            if is_main_process:
+                value = getattr(self.acquisition, attr, None)
+                if value is None:
+                    value = getattr(self.convergence, attr, None)
+                setattr(self, attr, value)
+            share_attr(self, attr)
 
     def plot_progress(self):
         """

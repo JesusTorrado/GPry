@@ -208,7 +208,7 @@ def _plot_2d_model_acquisition(gpr, acquisition, last_points=None, res=200):
     xx = np.ascontiguousarray(np.vstack([X.reshape(X.size), Y.reshape(Y.size)]).T)
     model_mean = gpr.predict(xx)
     # TODO: maybe change this one below if __call__ method added to GP_acquisition
-    acq_value = acquisition.acq_func(xx, gpr, eval_gradient=False)
+    acq_value = acquisition(xx, gpr, eval_gradient=False)
     # maybe show the next max of acquisition
     acq_max = xx[np.argmax(acq_value)]
     fig, ax = plt.subplots(1, 2, figsize=(8, 4))

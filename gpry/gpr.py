@@ -382,7 +382,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             self.account_for_inf.random_state = check_random_state(
                 random_state, convert_to_random_state=True)
 
-    def append_to_data(self, X, y, noise_level=None, fit=True, simplified_fit=False):
+    def append_to_data(self, X, y, noise_level=None, fit=True, simplified_fit=False, hyperparameter_bounds=None):
         r"""Append newly acquired data to the GP Model and updates it.
 
         Here updating refers to the re-calculation of
@@ -447,7 +447,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
                 warnings.warn("No model has previously been fit to the data, "
                               "a model will be fit with X and y instead of just "
                               "updating with the same kernel hyperparameters")
-            self.fit(X, y, noise_level=noise_level)
+            self.fit(X, y, noise_level=noise_level, hyperparameter_bounds=hyperparameter_bounds)
             return self
 
         if self.account_for_inf is not None:
@@ -526,7 +526,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         self.newly_appended_for_inv = y.shape[0]
 
         if fit:
-            self.fit(simplified=simplified_fit)
+            self.fit(simplified=simplified_fit, hyperparameter_bounds=hyperparameter_bounds)
         else:
             if self.preprocessing_X is not None:
                 X = self.preprocessing_X.transform(X)
@@ -585,6 +585,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             self.noise_level_ = np.delete(self.noise_level_, position)
             self.alpha = np.delete(self.alpha, position)
 
+        # TODO: add hyperparameter bounds
         if fit:
             self.fit(self.X_train, self.y_train)
 
@@ -615,7 +616,8 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         self.n_eval_loglike += 1
         return super().log_marginal_likelihood(*args, **kwargs)
 
-    def fit(self, X=None, y=None, noise_level=None, simplified=False):
+    def fit(self, X=None, y=None, noise_level=None, simplified=False,
+            hyperparameter_bounds=None):
         r"""Optimizes the hyperparameters :math:`\theta` for the training data
         given. The algorithm used to perform the optimization is very similar
         to the one provided by Scikit-learn. The only major difference is, that
@@ -733,10 +735,11 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
                     return -self.log_marginal_likelihood(theta,
                                                          clone_kernel=False)
             # First optimize starting from theta specified in kernel
-            bounds = self.kernel_.bounds
+            if hyperparameter_bounds is None:
+                hyperparameter_bounds = self.kernel_.bounds
             optima = [(self._constrained_optimization(obj_func,
                                                       self.kernel_.theta,
-                                                      bounds))]
+                                                      hyperparameter_bounds))]
 
             # Additional runs are performed from log-uniform chosen initial theta
             if self.n_restarts_optimizer > 0 and not simplified:
@@ -746,10 +749,11 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
                         "requires that all bounds are finite.")
                 for iteration in range(self.n_restarts_optimizer):
                     theta_initial = \
-                        self._rng.uniform(bounds[:, 0], bounds[:, 1])
+                        self._rng.uniform(hyperparameter_bounds[:, 0],
+                                          hyperparameter_bounds[:, 1])
                     optima.append(
                         self._constrained_optimization(obj_func, theta_initial,
-                                                       bounds))
+                                                       hyperparameter_bounds))
             # Select result from run with minimal (negative) log-marginal
             # likelihood
             lml_values = list(map(itemgetter(1), optima))
@@ -911,9 +915,9 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             raise ValueError("Mean grad and std grad not implemented \
                 for n_samples > 1")
 
-        if do_check_array and (self.kernel is None or self.kernel.requires_vector_input):
+        if validate and (self.kernel is None or self.kernel.requires_vector_input):
             X = check_array(X, ensure_2d=True, dtype="numeric")
-        elif do_check_array:
+        elif validate:
             X = check_array(X, ensure_2d=False, dtype=None)
 
         if not hasattr(self, "X_train_"):  # Not fit; predict based on GP prior
@@ -1003,7 +1007,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             # numerical issues. If yes: set the variance to 0.
             y_var_negative = y_var < 0
             if np.any(y_var_negative):
-                if self.verbose > 1:
+                if self.verbose > 4:
                     warnings.warn("Predicted variances smaller than 0. "
                                   "Setting those variances to 0.")
                 y_var[y_var_negative] = 0.0
