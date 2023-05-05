@@ -1,15 +1,17 @@
+import tempfile
 import warnings
 from copy import deepcopy
 from functools import partial
+from time import time
 import numpy as np
 import scipy.optimize
 from sklearn.base import is_regressor
 
 from gpry.acquisition_functions import LogExp, NonlinearLogExp
 from gpry.acquisition_functions import is_acquisition_function
-from gpry.proposal import PartialProposer, CentroidsProposer
+from gpry.proposal import PartialProposer, CentroidsProposer, UniformProposer
 from gpry.mpi import mpi_comm, mpi_rank, is_main_process, \
-    split_number_for_parallel_processes, multi_gather_array
+    split_number_for_parallel_processes, multi_gather_array, sync_processes
 from gpry.tools import check_random_state, NumpyErrorHandling
 
 
@@ -567,8 +569,8 @@ class Griffins(GPAcquisition):
         self.polychord_settings.read_resume = False
         self.polychord_settings.write_resume = False
         self.polychord_settings.write_live = False
-        self.polychord_settings.write_dead = False
-        self.polychord_settings.write_prior = False
+        self.polychord_settings.write_dead = True
+        self.polychord_settings.write_prior = True
         self.polychord_settings.feedback = verbose
         # Using rng state as seed for PolyChord
         if random_state is not None:
@@ -618,7 +620,166 @@ class Griffins(GPAcquisition):
         if level is None or level <= self.verbose:
             print(msg)
 
+    def get_MC_sample(self, gpr, random_state=None, sampler="polychord"):
+        """
+
+        Returns
+        -------
+        X, y, sigma_y
+            May return None for any of y, sigma_y
+        """
+        if sampler.lower() == "uniform":
+            return self._get_MC_sample_uniform(gpr, random_state)
+        if sampler.lower() == "polychord":
+            return self._get_MC_sample_polychord(gpr, random_state)
+        raise ValueError(f"Sampler '{sampler}' not known.")
+
+    def _get_MC_sample_uniform(self, gpr, random_state):
+        if not is_main_process:
+            return None, None, None
+        proposer = UniformProposer(self.bounds)
+        n_total = 8 * gpr.d
+        X = np.empty(shape=(n_total, gpr.d))
+        for i in range(n_total):
+            X[i] = proposer.get(random_state=random_state)
+        return X, None, None
+
+    def _get_MC_sample_polychord(self, gpr, random_state):
+
+        # Initialise "likelihood" -- returns GPR value and deals with pooling/ranking
+        def logp(X):
+            """
+            Returns the predicted value at a given point (-inf if prior=0).
+            """
+            return gpr.predict(np.atleast_2d(X), return_std=False, validate=False)[0], []
+
+        # Update PolyChord precision settings
+        self.update_NS_precision(gpr)
+        from pypolychord import run_polychord  # pylint: disable=import-outside-toplevel
+        if is_main_process:
+            # TODO: add to checkpoint folder?
+            tmpdir = tempfile.TemporaryDirectory().name
+            # ALT: persistent folder:
+            # tmpdir = tempfile.mkdtemp()
+            self.polychord_settings.base_dir = tmpdir
+            self.polychord_settings.file_root = "test"
+        with NumpyErrorHandling(all="ignore") as _:
+            self.last_polychord_output = run_polychord(
+                logp,
+                nDims=self.n_d, nDerived=0,
+                settings=self.polychord_settings,
+                prior=self.prior)
+            dummy_paramnames = [tuple(2 * [f"x_{i + 1}"]) for i in range(gpr.d)]
+            self.last_polychord_output.make_paramnames_files(dummy_paramnames)
+        if is_main_process:
+            prior_T = np.loadtxt(self.last_polychord_output.root + "_prior.txt").T
+            X_prior = prior_T[2:].T
+            y_prior = - prior_T[1] / 2  # this one is stored as chi2
+            dead_T = np.loadtxt(self.last_polychord_output.root + "_dead.txt").T
+            X_dead = dead_T[1:].T
+            y_dead = dead_T[0]  # this one stores logp
+            X = np.concatenate([X_prior, X_dead])
+            y = np.concatenate([y_prior, y_dead])
+            return X, y, None
+        return None, None, None
+
     def multi_add(self, gpr, n_points=1, random_state=None):
+        r"""Method to query multiple points where the objective function
+        shall be evaluated.
+
+        The strategy which is used to query multiple points is by using
+        the :math:`f(x)\sim \mu(x)` strategy and and not changing the
+        hyperparameters of the model.
+
+        It runs PolyChord on the mean of the GP model, tracking the value
+        of the acquisition function at every evaluation, and keeping a
+        pool of candidates which is re-sorted whenever a new good candidate
+        is found.
+
+        When run in parallel (MPI), returns the same values for all processes.
+
+        Parameters
+        ----------
+        gpr : GaussianProcessRegressor
+            The GP Regressor which is used as surrogate model.
+
+        n_points : int, optional (default=1)
+            Number of points returned by the optimize method
+            If the value is 1, a single point to evaluate is returned.
+
+            Otherwise a list of points to evaluate is returned of size
+            n_points. This is useful if you can evaluate your objective
+            in parallel, and thus obtain more objective function evaluations
+            per unit of time.
+
+        random_state : int or numpy.RandomState, optional
+            The generator used to initialize the centers. If an integer is
+            given, it fixes the seed. Defaults to the global numpy random
+            number generator.
+
+        Returns
+        -------
+        X : numpy.ndarray, shape = (X_dim, n_points)
+            The X values of the found optima
+        y_lies : numpy.ndarray, shape = (n_points,)
+            The predicted values of the GP at the proposed sampling locations
+        fval : numpy.ndarray, shape = (n_points,)
+            The values of the acquisition function at X_opt
+        """
+        # Check if n_points is positive and an integer
+        if not (isinstance(n_points, int) and n_points > 0):
+            raise ValueError(f"n_points should be int > 0, got {n_points}")
+        # Gather an MC sample
+        if is_main_process:
+            start_sample = time()
+        self.X, self.y, self.sigma_y = self.get_MC_sample(
+            gpr, random_state, sampler="polychord")
+        # Split for parallel processes (full arrays passed: a bit of overhead)
+        X = mpi_comm.bcast(self.X)
+        n_per_process = split_number_for_parallel_processes(len(X))
+        n_this_process = n_per_process[mpi_rank]
+        i_this_process = sum(n_per_process[:mpi_rank])
+        this_X = X[i_this_process: i_this_process + n_this_process]
+        y = mpi_comm.bcast(self.y)
+        sigma_y = mpi_comm.bcast(self.sigma_y)
+        if y is None:  # assume sigma_y is also None
+            if len(this_X) > 0:
+                this_y, this_sigma_y = gpr.predict(this_X, return_std=True, validate=False)
+            else:
+                this_y, this_sigma_y = np.array([], dtype=float), np.array([], dtype=float)
+            self.y, self.sigma_y = multi_gather_array([this_y, this_sigma_y])
+        elif sigma_y is None:
+            this_y = y[i_this_process: i_this_process + n_this_process]
+            if len(this_y) > 0:
+                _, this_sigma_y = gpr.predict(this_X, return_std=True, validate=False)
+                # assert np.allclose(this_y, _)
+            else:
+                this_sigma_y = np.array([], dtype=float)
+            self.sigma_y = multi_gather_array(this_sigma_y)[0]
+        else:
+            this_y = y[i_this_process: i_this_process + n_this_process]
+            this_sigma_y = sigma_y[i_this_process: i_this_process + n_this_process]
+        sync_processes()
+        if is_main_process:
+            self.log(f"[griffins] MC sampling took {time()-start_sample} seconds")
+        # Rank to get best points
+        # The size of the pool should be at least the amount of points to be acquired.
+        # If running several processes in parallel, it can be reduced down to the number
+        #   of points to be evaluated per process, but with less guarantee to find an
+        #   optimal set.
+        if is_main_process:
+            start_rank = time()
+        self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma)
+        this_acq = self.acq_func_y_sigma(this_y, this_sigma_y)
+        for X_i, y_i, sigma_y_i, acq_i in zip(this_X, this_y, this_sigma_y, this_acq):
+            self.pool.add_one(X_i, y_i, sigma_y_i, acq_i)
+        sync_processes()
+        if is_main_process:
+            self.log(f"[griffins] Ranking took {time()-start_rank} seconds")
+        # MPI-merge and return
+        return self.get_optimal_locations(n_points)
+
+    def multi_add_OLD_WORKING(self, gpr, n_points=1, random_state=None):
         r"""Method to query multiple points where the objective function
         shall be evaluated.
 

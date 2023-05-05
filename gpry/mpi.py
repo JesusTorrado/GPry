@@ -21,7 +21,6 @@ def get_random_state(seed=None):
 
     Parameters
     ----------
-
     seed : int or numpy seed, optional (default=None)
         A random seed to use. If none is provided a random one will be drawn.
     """
@@ -41,7 +40,6 @@ def split_number_for_parallel_processes(n, n_proc=mpi_size):
 
     Parameters
     ----------
-
     n : int
         The number of atomic tasks
     n_proc : int, optional (default=number of MPI comm's)
@@ -49,7 +47,6 @@ def split_number_for_parallel_processes(n, n_proc=mpi_size):
 
     Returns
     -------
-
     An array with the number of tasks corresponding each process.
     """
     n_rounded_to_nproc = int(np.ceil(n / n_proc)) * n_proc
@@ -65,13 +62,11 @@ def multi_gather_array(arrs):
 
     Parameters
     ----------
-
     arrs : array-like
         The arrays to gather
 
     Returns
     -------
-
     The gathered array(s) from all processes
     """
     if not isinstance(arrs, (list, tuple)):
