@@ -691,7 +691,7 @@ class Griffins(GPAcquisition):
                 nDims=self.n_d, nDerived=0,
                 settings=self.polychord_settings,
                 prior=self.prior)
-        dummy_paramnames = [2 * [f"x_{i + 1}"] for i in range(self.gpr.d)]
+        dummy_paramnames = [2 * [f"x_{i + 1}"] for i in range(gpr.d)]
         self.last_polychord_output.make_paramnames_files(dummy_paramnames)
         try:
             self.mean = self.last_polychord_output.posterior.means
