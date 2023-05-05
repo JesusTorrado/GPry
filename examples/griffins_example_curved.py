@@ -50,6 +50,7 @@ from gpry.preprocessing import Normalize_bounds
 from gpry.gp_acquisition import Griffins, GPAcquisition
 acquisition = Griffins(
     model.prior.bounds(), acq_func="NonlinearLogExp",
+    mc_every=model.prior.d(),
    preprocessing_X=Normalize_bounds(model.prior.bounds()),
    zeta_scaling=0.85, verbose=verbose)
 #acquisition = GPAcquisition(

@@ -477,6 +477,10 @@ class Griffins(GPAcquisition):
         Acquisition function to maximize/minimize. If none is given the
         `LogExp` acquisition function will be used
 
+    mc_every : int
+        If >1, only calls the MC sampler every `mc_steps`, and reuses previous X
+        otherwise, recomputing y and sigma with the new GPR.
+
     random_state : int or numpy.RandomState, optional
         The generator used to initialize the centers. If an integer is
         given, it fixes the seed. Defaults to the global numpy random
@@ -526,6 +530,7 @@ class Griffins(GPAcquisition):
 
     def __init__(self, bounds,
                  acq_func="LogExp",
+                 mc_every=1,
                  preprocessing_X=None,
                  random_state=None,
                  zeta_scaling=0.85,
@@ -547,6 +552,8 @@ class Griffins(GPAcquisition):
         self.n_d = np.shape(bounds)[0]
         self.preprocessing_X = preprocessing_X
         self.verbose = verbose
+        self.mc_every = int(mc_every)
+        self.mc_every_i = 0
         if is_acquisition_function(acq_func):
             self.acq_func = acq_func
         elif acq_func == "LogExp":
@@ -732,8 +739,13 @@ class Griffins(GPAcquisition):
         # Gather an MC sample
         if is_main_process:
             start_sample = time()
-        self.X, self.y, self.sigma_y = self.get_MC_sample(
-            gpr, random_state, sampler="polychord")
+        if self.mc_every_i % self.mc_every:  # reuse
+            self.X, self.y, self.sigma_y = self.X, None, None
+            # TODO: implement reweighting!
+        else:
+            self.X, self.y, self.sigma_y = self.get_MC_sample(
+                gpr, random_state, sampler="polychord")
+        self.mc_every_i += 1
         # Split for parallel processes (full arrays passed: a bit of overhead)
         X = mpi_comm.bcast(self.X)
         n_per_process = split_number_for_parallel_processes(len(X))
