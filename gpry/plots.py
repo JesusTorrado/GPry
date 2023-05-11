@@ -362,9 +362,10 @@ def _plot_2d_model_acquisition_std(gpr, acquisition, last_points=None, res=200):
     ax[2].set_title(label[2])
     Z = model_std
     Z_finite = Z[np.isfinite(model_mean)]
-    print("Ranges of finite STD :: ",min(Z_finite), max(Z_finite))
     Z[~np.isfinite(model_mean)] = -np.inf
-    levels = np.linspace(min(Z_finite), max(Z_finite),  500)
+    minz = min(Z_finite)
+    zrange = max(Z_finite)-minz
+    levels = np.linspace(minz, minz + (zrange if zrange>0 else 0.00001),  500)
     #Z[np.isfinite(model_mean)] = np.clip(Z_finite, min(levels), max(levels))
     Z = Z.reshape(*X.shape)
     norm = cm.colors.Normalize(vmax=max(levels), vmin=min(levels))
