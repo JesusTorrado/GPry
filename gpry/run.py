@@ -591,9 +591,9 @@ class Runner(object):
                 self.log(f"[FIT] ({timer_fit.time:.2g} sec) Fitted GP model with new "
                          "acquired points, "
                          f"{hyperparams_or_not}including GPR hyperparameters. "
-                         f"{self.gpr.n_last_appended_finite} finite points were added to "
+                         f"{(self.gpr.n_last_appended_finite if sum(np.isfinite(new_y)) else 0)} finite points were added to "
                          "the GPR.", level=3)
-                self.log(f"Current GPR kernel: {self.gpr.kernel_}", level=4)
+                self.log(f"Current GPR kernel: {self.gpr.kernel_}", level=2)
             self._share_gpr_from_main()
             sync_processes()
             # share new_X, new_y and y_pred to the runner instance
