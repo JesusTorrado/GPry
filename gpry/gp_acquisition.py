@@ -781,7 +781,7 @@ class Griffins(GPAcquisition):
         #   optimal set.
         if is_main_process:
             start_rank = time()
-        self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma)
+        self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma, verbose= self.verbose-3)
         this_acq = self.acq_func_y_sigma(this_y, this_sigma_y)
         for X_i, y_i, sigma_y_i, acq_i in zip(this_X, this_y, this_sigma_y, this_acq):
             self.pool.add_one(X_i, y_i, sigma_y_i, acq_i)
@@ -842,7 +842,7 @@ class Griffins(GPAcquisition):
         # If running several processes in parallel, it can be reduced down to the number
         #   of points to be evaluated per process, but with less guarantee to find an
         #   optimal set.
-        self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma)
+        self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma, verbose = self.verbose-3)
 
         # Initialise "likelihood" -- returns GPR value and deals with pooling/ranking
         def logp(X):
@@ -943,7 +943,7 @@ class RankedPool():
         self.acq = np.full((size + 1), -np.inf)  # -np.inf represents an empty slot
         self._gpr = gpr
         self._acq_func = acq_func
-        self.verbose = False
+        self.verbose = verbose
 
     def __len__(self):
         return len(self.y) - 1
@@ -961,7 +961,7 @@ class RankedPool():
         return self.acq[len(self) - 1]
 
     # TODO: abstract these to a class
-    def log(self, msg, level=None):
+    def log(self, level=None, msg = ""):
         """
         Print a message if its verbosity level is equal or lower than the given one (or
         always if ``level=None``.
@@ -1132,10 +1132,10 @@ class RankedPool():
                 self._acq_func(self.y[i_new + 1:], sigmas_cond),
                 a_min=None, a_max=self.acq[i_new + 1:])
         self.log(level=4, msg="[pool.add] Current unsorted pool:")
-        self.log_pool(level=4)
+        self.log_pool(level=4,include_last=True)
         self.sort(i_new + 1)
         self.log(level=4, msg="[pool.add] The new pool, sorted:")
-        self.log_pool(level=4)
+        self.log_pool(level=4,include_last=True)
 
     def cache_model(self, i):
         """
