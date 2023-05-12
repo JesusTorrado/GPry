@@ -895,7 +895,6 @@ class Griffins(GPAcquisition):
         pool_acq = mpi_comm.gather(self.pool.acq[:len(self.pool)])
         if is_main_process:
             # Discard unfilled positions
-            # (NB: with PolyChord and #mpi-proceses > 1, the whole rank-0 pool is empty)
             pool_acq = np.concatenate(pool_acq)
             i_notnan = np.invert(np.isnan(pool_acq))
             pool_acq = pool_acq[i_notnan]
@@ -909,15 +908,22 @@ class Griffins(GPAcquisition):
         Merges the pools of parallel processes to find ``n_points`` optimal locations.
 
         Returns all these locations for all processes.
+
+        Acquisition values returned are *unconditional*.
         """
         if not multiple_processes:  # no need to merge and re-sort
-            return self.pool.X[:n_points], self.pool.y[:n_points], self.pool.acq[:n_points]
+            pool_acq = self.acq_func_y_sigma(
+                self.pool.y[:n_points], self.pool.sigma[:n_points])
+            return self.pool.X[:n_points], self.pool.y[:n_points], pool_acq
         pool_X, pool_y, pool_sigma = self.mpi_gather_pools()
+        merged_pool = None
         if is_main_process:
-            self.pool.add(pool_X, pool_y, pool_sigma)
-        pool = mpi_comm.bcast(self.pool)
-        pool_acq = self.acq_func_y_sigma(pool.y[:n_points], pool.sigma[:n_points])
-        return pool.X[:n_points], pool.y[:n_points], pool_acq
+            merged_pool = self.pool.empty_copy()
+            merged_pool.add(pool_X, pool_y, pool_sigma)
+        merged_pool = mpi_comm.bcast(merged_pool)
+        pool_acq = self.acq_func_y_sigma(
+            merged_pool.y[:n_points], merged_pool.sigma[:n_points])
+        return merged_pool.X[:n_points], merged_pool.y[:n_points], pool_acq
 
 
 class RankedPool():
@@ -947,15 +953,20 @@ class RankedPool():
         # The pool should have one more element than the number of desired points.
         self.X = np.zeros((size + 1, gpr.d))
         self.y = np.zeros((size + 1))
-        self.sigma = np.zeros((size + 1))  # only used for logging purposes
+        self.sigma = np.zeros((size + 1))  # keps track of the input one
+        self.sigma_cond = np.zeros((size + 1))  # conditioned, used for logging purposes
         self.gpr = (size - 1) * [None]
-        self.acq = np.full((size + 1), -np.inf)  # -np.inf represents an empty slot
+        self.acq = np.full((size + 1), -np.inf)  # conditioned; -np.inf means empty slot
         self._gpr = gpr
         self._acq_func = acq_func
         self.verbose = verbose
 
     def __len__(self):
         return len(self.y) - 1
+
+    def empty_copy(self):
+        return RankedPool(size=len(self), gpr=self._gpr, acq_func=self._acq_func,
+                          verbose=self.verbose)
 
     @property
     def min_acq(self):
@@ -978,17 +989,19 @@ class RankedPool():
         if level is None or level <= self.verbose:
             print(msg)
 
-    def str_point(self, X, y, sigma, acq):
+    def str_point(self, X, y, sigma, acq, sigma_cond=None):
         """Retuns a standardised string to log a point."""
-        return f"{X}, y = {y} +/- {sigma}; acq = {acq}"
+        sigma_cond_str =  f" ({sigma_cond})" if sigma_cond is not None else ""
+        return f"{X}, y = {y} +/- {sigma}{sigma_cond_str}; acq = {acq}"
 
     def str_pool(self, include_last=False):
         """Returns a string representation of the current pool."""
         pool_str = ""
         for i in range(len(self.X) + (-1 if not include_last else 0)):
             pool_str += f"{i + 1} : " + self.str_point(
-                self.X[i], self.y[i], self.sigma[i], self.acq[i]) + "\n"
-        return pool_str.rstrip("\n")
+                self.X[i], self.y[i], self.sigma[i], self.acq[i],
+                sigma_cond=self.sigma_cond[i]) + "\n"
+        return pool_str.rstrip("\n") + (" [unused]" if include_last else "")
 
     def log_pool(self, level=4, include_last=False):
         """Prints the current pool."""
@@ -1022,14 +1035,13 @@ class RankedPool():
             return
         # Multiple points: sort in descending order of acquisition function values before
         # adding them one-by-one, for stability, since the addition order has some
-        # influence on the final order.
+        # influence on the final order. It is also faster: fewer insertions into the pool.
         if y is None:
             y, sigma = self._gpr.predict(X, return_std=True, validate=False)
         acq = self._acq_func(y, sigma)
         i_sort = np.argsort(acq)[::-1]  # descending order
-        X, y, sigma, acq = X[i_sort], y[i_sort], sigma[i_sort], acq[i_sort]
-        for X_i, y_i, sigma_i, acq_i in zip(X, y, sigma, acq):
-            self.add_one(X_i, y_i, sigma_i, acq_i)
+        for i in i_sort:
+            self.add_one(X[i], y[i], sigma[i], acq[i])
 
     def add_one(self, X, y=None, sigma=None, acq=None):
         """
@@ -1129,10 +1141,11 @@ class RankedPool():
         # We track the acq. value (but not the sigma), to retain the information about
         # whether each slot was empty (acq = -inf)
         # (but not for the acq values, which will be updated below)
-        for pool, value in [(self.X, X), (self.y, y), (self.acq, acq_cond)]:
+        for pool, value in [(self.X, X), (self.y, y),
+                            (self.sigma, sigma), (self.acq, acq_cond)]:
             pool[i_new + 1:] = pool[i_new:-1]
             pool[i_new] = value
-        self.sigma[i_new] = sigma_cond  # the ones below will be discarded
+        self.sigma_cond[i_new] = sigma_cond  # the ones below will be discarded
         # For the sub-list below the new element: update acquisitions, cache and sort
         if i_new < len(self) - 1:
             # If not in the last position, we can safely assume that it has finite value,
@@ -1148,10 +1161,10 @@ class RankedPool():
                 self._acq_func(self.y[i_new + 1:], sigmas_cond),
                 a_min=None, a_max=self.acq[i_new + 1:])
         self.log(level=4, msg="[pool.add] Current unsorted pool:")
-        self.log_pool(level=4,include_last=True)
+        self.log_pool(level=4, include_last=True)
         self.sort(i_new + 1)
         self.log(level=4, msg="[pool.add] The new pool, sorted:")
-        self.log_pool(level=4,include_last=True)
+        self.log_pool(level=4, include_last=True)
 
     def cache_model(self, i):
         """
