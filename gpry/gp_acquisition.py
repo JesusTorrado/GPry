@@ -10,7 +10,7 @@ from sklearn.base import is_regressor
 from gpry.acquisition_functions import LogExp, NonlinearLogExp
 from gpry.acquisition_functions import is_acquisition_function
 from gpry.proposal import PartialProposer, CentroidsProposer, UniformProposer
-from gpry.mpi import mpi_comm, mpi_rank, is_main_process, \
+from gpry.mpi import mpi_comm, mpi_rank, is_main_process, multiple_processes, \
     split_number_for_parallel_processes, multi_gather_array, sync_processes
 from gpry.tools import check_random_state, NumpyErrorHandling
 
@@ -910,6 +910,8 @@ class Griffins(GPAcquisition):
 
         Returns all these locations for all processes.
         """
+        if not multiple_processes:  # no need to merge and re-sort
+            return self.pool.X[:n_points], self.pool.y[:n_points], self.pool.acq[:n_points]
         pool_X, pool_y, pool_sigma = self.mpi_gather_pools()
         if is_main_process:
             self.pool.add(pool_X, pool_y, pool_sigma)
@@ -980,14 +982,21 @@ class RankedPool():
         """Retuns a standardised string to log a point."""
         return f"{X}, y = {y} +/- {sigma}; acq = {acq}"
 
-    def log_pool(self, level=4, include_last=False):
-        """Prints the current pools."""
-        if self.verbose < level:
-            return
+    def str_pool(self, include_last=False):
+        """Returns a string representation of the current pool."""
+        pool_str = ""
         for i in range(len(self.X) + (-1 if not include_last else 0)):
-            self.log(level=level,
-                     msg=(f"{i + 1} : " + self.str_point(
-                         self.X[i], self.y[i], self.sigma[i], self.acq[i])))
+            pool_str += f"{i + 1} : " + self.str_point(
+                self.X[i], self.y[i], self.sigma[i], self.acq[i]) + "\n"
+        return pool_str.rstrip("\n")
+
+    def log_pool(self, level=4, include_last=False):
+        """Prints the current pool."""
+        if self.verbose >= level:
+            self.log(level=level, msg=self.str_pool(include_last=include_last))
+
+    def __str__(self):
+        return self.str_pool(include_last=False)
 
     def add(self, X, y=None, sigma=None):
         """
