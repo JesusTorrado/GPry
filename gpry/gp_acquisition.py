@@ -501,8 +501,8 @@ class Griffins(GPAcquisition):
         live points per sample in the current training set.
         Not recommended to decrease it.
 
-    nlive_per_dim_min: int
-        live points min cap (times dimension).
+    nlive_per_dim_max: int
+        live points max cap (times dimension).
 
     num_repeats_per_dim: int
         length of slice-chains times dimension.
@@ -541,10 +541,10 @@ class Griffins(GPAcquisition):
                  zeta=None,
                  use_prior_sample=False,
                  nlive_per_training=3,
-                 nlive_per_dim_min=40,
-                 num_repeats_per_dim=8,
+                 nlive_per_dim_max=25,
+                 num_repeats_per_dim=5,
                  precision_criterion_target=0.005,
-                 nprior_per_nlive=25,
+                 nprior_per_nlive=10,
                  verbose=1):
         try:
             # pylint: disable=import-outside-toplevel
@@ -591,7 +591,7 @@ class Griffins(GPAcquisition):
                 random_state.bit_generator.state["state"]["state"] + mpi_rank
         # Prepare precision parameters
         self.nlive_per_training = nlive_per_training
-        self.nlive_per_dim_min = nlive_per_dim_min
+        self.nlive_per_dim_max = nlive_per_dim_max
         self.num_repeats_per_dim = num_repeats_per_dim
         self.precision_criterion_target = precision_criterion_target
         self.nprior_per_nlive = nprior_per_nlive
@@ -619,7 +619,7 @@ class Griffins(GPAcquisition):
         """
         self.polychord_settings.nlive = min(
             self.nlive_per_training * gpr.n,
-            self.nlive_per_dim_min * self.n_d)
+            self.nlive_per_dim_max * self.n_d)
         self.polychord_settings.num_repeats = self.num_repeats_per_dim * self.n_d
         self.polychord_settings.precision_criterion = self.precision_criterion_target
         self.polychord_settings.nprior = \
