@@ -66,7 +66,7 @@ from gpry.run import Runner
 runner = Runner(model, checkpoint=checkpoint, load_checkpoint="overwrite",
 ####                account_for_inf=None,  # FOR NOW, DISABLE SVM!!!
                 gp_acquisition=acquisition,
-                seed=10, verbose=verbose, plots=False, options=options)
+                seed=None, verbose=verbose, plots=False, options=options)
 
 # Run the GP
 runner.run()
