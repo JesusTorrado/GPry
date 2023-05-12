@@ -493,6 +493,10 @@ class Griffins(GPAcquisition):
     zeta: float, optional (default: None, uses zeta_scaling)
         Specifies the value of the zeta parameter directly.
 
+    use_prior_sample: bool
+        Whether to use the initial prior sample from PolyChord for the ranking. Can be
+        large in high dimension. Default: False.
+
     nlive_per_training: int
         live points per sample in the current training set.
         Not recommended to decrease it.
@@ -535,6 +539,7 @@ class Griffins(GPAcquisition):
                  random_state=None,
                  zeta_scaling=0.85,
                  zeta=None,
+                 use_prior_sample=False,
                  nlive_per_training=3,
                  nlive_per_dim_min=40,
                  num_repeats_per_dim=8,
@@ -554,6 +559,7 @@ class Griffins(GPAcquisition):
         self.verbose = verbose
         self.mc_every = int(mc_every)
         self.mc_every_i = 0
+        self.use_prior_sample = use_prior_sample
         if is_acquisition_function(acq_func):
             self.acq_func = acq_func
         elif acq_func == "LogExp":
@@ -679,14 +685,15 @@ class Griffins(GPAcquisition):
             dummy_paramnames = [tuple(2 * [f"x_{i + 1}"]) for i in range(gpr.d)]
             self.last_polychord_output.make_paramnames_files(dummy_paramnames)
         if is_main_process:
-            prior_T = np.loadtxt(self.last_polychord_output.root + "_prior.txt").T
-            X_prior = prior_T[2:].T
-            y_prior = - prior_T[1] / 2  # this one is stored as chi2
             dead_T = np.loadtxt(self.last_polychord_output.root + "_dead.txt").T
-            X_dead = dead_T[1:].T
-            y_dead = dead_T[0]  # this one stores logp
-            X = np.concatenate([X_prior, X_dead])
-            y = np.concatenate([y_prior, y_dead])
+            X = dead_T[1:].T
+            y = dead_T[0]  # this one stores logp
+            if self.use_prior_sample:
+                prior_T = np.loadtxt(self.last_polychord_output.root + "_prior.txt").T
+                X_prior = prior_T[2:].T
+                y_prior = - prior_T[1] / 2  # this one is stored as chi2
+                X = np.concatenate([X_prior, X])
+                y = np.concatenate([y_prior, y])
             return X, y, None
         return None, None, None
 
@@ -783,8 +790,8 @@ class Griffins(GPAcquisition):
             start_rank = time()
         self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma, verbose= self.verbose-3)
         this_acq = self.acq_func_y_sigma(this_y, this_sigma_y)
-        for X_i, y_i, sigma_y_i, acq_i in zip(this_X, this_y, this_sigma_y, this_acq):
-            self.pool.add_one(X_i, y_i, sigma_y_i, acq_i)
+        for i in range(len(this_X) - 1, -1, -1):
+            self.pool.add_one(this_X[i], this_y[i], this_sigma_y[i], this_acq[i])
         sync_processes()
         if is_main_process:
             self.log(f"[griffins] Ranking took {time()-start_rank} seconds")
