@@ -1058,7 +1058,7 @@ class LogExp(BaseLogExp):
     @staticmethod
     def f(mu, std, baseline, noise_level, zeta):
         """Linearized exponentiated log-error bar."""
-        return 2 * zeta * (mu-baseline) + np.log(np.clip(np.sqrt(std**2.-noise_level**2.), 0., None))
+        return 2 * zeta * (mu-baseline) + np.log(np.sqrt(np.clip(std**2.-noise_level**2., 0., None)))
 
 
 # UNUSED
@@ -1112,7 +1112,7 @@ class NonlinearLogExp(BaseLogExp):
     @staticmethod
     def f(mu, std, baseline, noise_level, zeta):
         """Exponentiated log-error bar"""
-        return 2 * zeta * (mu-baseline) + _safe_log_expm1(np.clip(np.sqrt(std**2.-noise_level**2.), 0., None))
+        return 2 * zeta * (mu-baseline) + _safe_log_expm1(np.sqrt(np.clip(std**2.-noise_level**2., 0., None)))
 
 
 # Function for determining whether an object is an acquisition function
