@@ -789,7 +789,7 @@ class Griffins(GPAcquisition):
         if is_main_process:
             start_rank = time()
         self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma, verbose= self.verbose-3)
-        this_acq = self.acq_func_y_sigma(this_y, this_sigma_y)
+        this_acq = self.acq_func_y_sigma(this_y, this_sigma_y, gpr.y_max, gpr.noise_level)
         for i in range(len(this_X) - 1, -1, -1):
             self.pool.add_one(this_X[i], this_y[i], this_sigma_y[i], this_acq[i])
         sync_processes()
@@ -913,7 +913,7 @@ class Griffins(GPAcquisition):
         """
         if not multiple_processes:  # no need to merge and re-sort
             pool_acq = self.acq_func_y_sigma(
-                self.pool.y[:n_points], self.pool.sigma[:n_points])
+                self.pool.y[:n_points], self.pool.sigma[:n_points], self.pool.y_max, self.pool.noise_level)
             return self.pool.X[:n_points], self.pool.y[:n_points], pool_acq
         pool_X, pool_y, pool_sigma = self.mpi_gather_pools()
         merged_pool = None
@@ -922,7 +922,7 @@ class Griffins(GPAcquisition):
             merged_pool.add(pool_X, pool_y, pool_sigma)
         merged_pool = mpi_comm.bcast(merged_pool)
         pool_acq = self.acq_func_y_sigma(
-            merged_pool.y[:n_points], merged_pool.sigma[:n_points])
+            merged_pool.y[:n_points], merged_pool.sigma[:n_points], merged_pool.y_max, merged_pool.noise_level)
         return merged_pool.X[:n_points], merged_pool.y[:n_points], pool_acq
 
 
@@ -960,6 +960,8 @@ class RankedPool():
         self._gpr = gpr
         self._acq_func = acq_func
         self.verbose = verbose
+        self.noise_level = self._gpr.noise_level
+        self.y_max = self._gpr.y_max
 
     def __len__(self):
         return len(self.y) - 1
@@ -1038,7 +1040,7 @@ class RankedPool():
         # influence on the final order. It is also faster: fewer insertions into the pool.
         if y is None:
             y, sigma = self._gpr.predict(X, return_std=True, validate=False)
-        acq = self._acq_func(y, sigma)
+        acq = self._acq_func(y, sigma, self.y_max, self.noise_level)
         i_sort = np.argsort(acq)[::-1]  # descending order
         for i in i_sort:
             self.add_one(X[i], y[i], sigma[i], acq[i])
@@ -1094,7 +1096,8 @@ class RankedPool():
             self.log(level=4, msg="[pool.add] Acq. func. value too small. Ignoring.")
             return
         if np.isnan(acq):
-            raise ValueError(f"Acquisition function value not a number: {acq}")
+            acq = -np.inf
+            # raise ValueError(f"Acquisition function value not a number: {acq}")
         self.log(level=4, msg="[pool.add] Initial pool:")
         self.log_pool(level=4)
         # Find its position in the list, conditioned to those on top
@@ -1127,7 +1130,7 @@ class RankedPool():
             # length is really huge. Also, when alpha or the noise level for two cached
             # models are different. We can just ignore it.
             # (Sometimes, it's just ~1e6 relative differences, which is not worrying)
-            acq_cond = min(acq_cond, self._acq_func(y, sigma_cond))
+            acq_cond = min(acq_cond, self._acq_func(y, sigma_cond, self.y_max, self.noise_level))
             self.log(
                 level=4,
                 msg=f"[pool.add] --> updated conditional acquisition: {self.acq[i_new]}")
@@ -1158,7 +1161,7 @@ class RankedPool():
             # Again, cond acq cannot be higher then less cond one.
             # In particular, keep -inf if it was so
             self.acq[i_new + 1:] = np.clip(
-                self._acq_func(self.y[i_new + 1:], sigmas_cond),
+                self._acq_func(self.y[i_new + 1:], sigmas_cond, self.y_max, self.noise_level),
                 a_min=None, a_max=self.acq[i_new + 1:])
         self.log(level=4, msg="[pool.add] Current unsorted pool:")
         self.log_pool(level=4, include_last=True)
