@@ -527,6 +527,7 @@ class Runner(object):
             self.old_gpr = deepcopy(self.gpr)
             self.progress.add_current_n_truth(self.gpr.n_total, self.gpr.n_finite)
             # Acquire new points in parallel
+            sync_processes()  # to sync the timer
             with TimerCounter(self.gpr) as timer_acq:
                 new_X, y_pred, acq_vals = self.acquisition.multi_add(
                     self.gpr, n_points=self.n_points_per_acq, random_state=self.random_state)
@@ -537,11 +538,11 @@ class Runner(object):
                 self.log("New location(s) proposed, as [X, logp_gp(X), acq(X)]:", level=4)
                 for X, y, acq in zip(new_X, y_pred, acq_vals):
                     self.log(f"   {X} {y} {acq}", level=4)
-            sync_processes()
             # Get logposterior value(s) for the acquired points (in parallel)
             new_X_this_process = new_X[
                 i_evals_this_process: i_evals_this_process + n_evals_this_process]
             new_y_this_process = np.empty(0)
+            sync_processes()  # to sync the timer
             with Timer() as timer_truth:
                 for x in new_X_this_process:
                     self.log(f"[{mpi_rank}] Evaluating true posterior at {x}", level=4)
@@ -727,6 +728,7 @@ class Runner(object):
             np.ceil(self.max_initial / n_to_sample_per_process))
         # Initial samples loop. The initial samples are drawn from the prior
         # and according to the distribution of the prior.
+        sync_processes()  # to sync the timer
         with Timer() as timer_truth:
             for i in range(n_iterations_before_giving_up):
                 X_init_loop = np.empty((0, self.d))

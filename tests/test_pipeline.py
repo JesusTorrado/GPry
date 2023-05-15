@@ -49,25 +49,26 @@ def _test_pipeline(model, gpr="RBF", gp_acquisition="LogExp",
 
     # TODO: does not return reasonable values
     # Compare with the true function to get the KL divergence
-    s = sampler.products()["sample"]
-    x_values = s.data[s.sampled_params]
-    logp = s['minuslogpost']
-    logp = -logp
-    weights = s['weight']
-    y_values = []
-    # VERY hacky, is there a better way?
-    for i in range(len(x_values)):
-        sample = dict(zip(
-            list(model.parameterization.sampled_params()), np.array(x_values.iloc[i])))
-        # Only works for uniform priors for now. Need to fix this
-        y_values = np.append(y_values, model.logpost(sample) + model.logprior(sample))
-    logq = np.array(y_values)
-    mask = np.isfinite(logq)
-    logp2 = logp[mask]
-    logq2 = logq[mask]
-    weights2 = weights[mask]
-    kl = np.abs(np.sum(weights2 * (logp2 - logq2)) / np.sum(weights2))
-    assert kl <= desired_kl, f"The desired KL value wasn't reached: {kl} < {desired_kl}"
+    if is_main_process:
+        s = sampler.products()["sample"]
+        x_values = s.data[s.sampled_params]
+        logp = s['minuslogpost']
+        logp = -logp
+        weights = s['weight']
+        y_values = []
+        # VERY hacky, is there a better way?
+        for i in range(len(x_values)):
+            sample = dict(zip(
+                list(model.parameterization.sampled_params()), np.array(x_values.iloc[i])))
+            # Only works for uniform priors for now. Need to fix this
+            y_values = np.append(y_values, model.logpost(sample) + model.logprior(sample))
+        logq = np.array(y_values)
+        mask = np.isfinite(logq)
+        logp2 = logp[mask]
+        logq2 = logq[mask]
+        weights2 = weights[mask]
+        kl = np.abs(np.sum(weights2 * (logp2 - logq2)) / np.sum(weights2))
+        assert kl <= desired_kl, f"The desired KL value wasn't reached: {kl} < {desired_kl}"
 
 
 @pytest.mark.parametrize("dim", [1, 2, 3])
@@ -80,4 +81,9 @@ def test_gaussian(dim):
         generator.redraw()
     generator = mpi_comm.bcast(generator)
     model = generator.get_model()
-    _test_pipeline(model)
+    _test_pipeline(model, desired_kl=0.05, mean=generator.mean, cov=generator.cov)
+
+
+if __name__ == "__main__":
+    import sys
+    test_gaussian(dim=int(sys.argv[1]))

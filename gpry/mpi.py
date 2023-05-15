@@ -58,7 +58,9 @@ def split_number_for_parallel_processes(n, n_proc=mpi_size):
 
 def multi_gather_array(arrs):
     """
-    Gathers (possibly a list of) arrays from all processes into the main process
+    Gathers (possibly a list of) arrays from all processes into the main process.
+
+    NB: mpi-gather guarantees rank order is preserved.
 
     Parameters
     ----------

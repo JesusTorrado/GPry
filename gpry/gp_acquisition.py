@@ -11,7 +11,7 @@ from gpry.acquisition_functions import LogExp, NonlinearLogExp
 from gpry.acquisition_functions import is_acquisition_function
 from gpry.proposal import PartialProposer, CentroidsProposer, UniformProposer
 from gpry.mpi import mpi_comm, mpi_rank, is_main_process, multiple_processes, \
-    split_number_for_parallel_processes, multi_gather_array, sync_processes
+    split_number_for_parallel_processes, multi_gather_array, sync_processes, share_attr
 from gpry.tools import check_random_state, NumpyErrorHandling
 
 
@@ -602,7 +602,7 @@ class Griffins(GPAcquisition):
         # Pool for storing intermediate results during parallelised acquisition
         self.pool = None
         self.last_polychord_output = None
-        self.X, self.y, self.sigma_y = None, None, None
+        self.X, self.y, self.sigma_y, self.acq_value = None, None, None, None
         self.log_header = f"[ACQUISITION : {self.__class__.__name__}] "
 
     @property
@@ -758,7 +758,55 @@ class Griffins(GPAcquisition):
         else:  # reuse
             self.X, self.y, self.sigma_y = self.X, None, None
         self.mc_every_i += 1
-        # Split for parallel processes (full arrays passed: a bit of overhead)
+        # Compute acq functions and missing quantities.
+        self.acq_func_y_sigma = partial(
+            self.acq_func.f, baseline=gpr.y_max,
+            noise_level=gpr.noise_level, zeta=self.acq_func.zeta)
+        this_X, this_y, this_sigma_y, this_acq = \
+            self._compute_acq_and_missing_y_sigma(gpr=gpr)
+        sync_processes()
+        if is_main_process:
+            what_we_did = ("Obtained new MC sample" if mc_sample_this_time
+                           else "Re-evaluated previous MC sample")
+            self.log(
+                f"({(time()-start_sample):.2g} sec) {what_we_did}")
+        # Rank to get best points.
+        if is_main_process:
+            start_rank = time()
+        # TESTS UNDERWAY -- DO NOT CHANGE BETWEEN THESE COMMENTS -------------------------
+        # sync_processes()
+        # s = time()
+        # merged_pool = self._parallel_rank_and_merge(
+        #     this_X, this_y, this_sigma_y, this_acq, n_points, gpr)
+        # if is_main_process:
+        #     PARA = time() - s
+        #     # print(merged_pool)
+        # sync_processes()
+        # s = time()
+        merged_pool = self._rank(n_points, gpr)
+        # if is_main_process:
+        #     NOPA = time() - s
+        #     # print(merged_pool)
+        # print(f"Diff parallel: {NOPA - PARA} (<0 is better w/o parallelisation)")
+        # --------------------------------------------------------------------------------
+        with np.errstate(divide='ignore'):
+            merged_pool_acq = self.acq_func_y_sigma(
+                merged_pool.y[:n_points], merged_pool.sigma[:n_points])
+        sync_processes()
+        if is_main_process:
+            self.log(
+                f"({(time()-start_rank):.2g} sec) Ranked pool of candidates.")
+        return merged_pool.X[:n_points], merged_pool.y[:n_points], merged_pool_acq
+
+    def _compute_acq_and_missing_y_sigma(self, gpr, merge_output=False):
+        """
+        Ensures a full set of `X, y, sigma_y, acq_value`, attributes starting from current
+        attribute values, which are assumed equal-valued for all ranks.
+
+        Returns scattered arrays for these values for all processes.
+
+        Parallelises the computation if possible (returns split arrays per process).
+        """
         X = mpi_comm.bcast(self.X)
         n_per_process = split_number_for_parallel_processes(len(X))
         n_this_process = n_per_process[mpi_rank]
@@ -768,10 +816,13 @@ class Griffins(GPAcquisition):
         sigma_y = mpi_comm.bcast(self.sigma_y)
         if y is None:  # assume sigma_y is also None
             if len(this_X) > 0:
-                this_y, this_sigma_y = gpr.predict(this_X, return_std=True, validate=False)
+                this_y, this_sigma_y = gpr.predict(
+                    this_X, return_std=True, validate=False)
             else:
                 this_y, this_sigma_y = np.array([], dtype=float), np.array([], dtype=float)
             self.y, self.sigma_y = multi_gather_array([this_y, this_sigma_y])
+            share_attr(self, "y")
+            share_attr(self, "sigma_y")
         elif sigma_y is None:
             this_y = y[i_this_process: i_this_process + n_this_process]
             if len(this_y) > 0:
@@ -780,41 +831,43 @@ class Griffins(GPAcquisition):
             else:
                 this_sigma_y = np.array([], dtype=float)
             self.sigma_y = multi_gather_array(this_sigma_y)[0]
+            share_attr(self, "sigma_y")
         else:
             this_y = y[i_this_process: i_this_process + n_this_process]
             this_sigma_y = sigma_y[i_this_process: i_this_process + n_this_process]
-        sync_processes()
+        with np.errstate(divide='ignore'):
+            this_acq = self.acq_func_y_sigma(this_y, this_sigma_y)
+        self.acq_value = multi_gather_array(this_acq)[0]
+        share_attr(self, "acq_value")
+        return this_X, this_y, this_sigma_y, this_acq
+
+    def _rank(self, n_points, gpr):
         if is_main_process:
-            what_we_did = ("Obtained new MC sample" if mc_sample_this_time
-                           else "Re-evaluated previous MC sample")
-            self.log(
-                f"({(time()-start_sample):.2g} sec) {what_we_did}")
-        # Rank to get best points
+            self.pool = RankedPool(
+                n_points, gpr=gpr, acq_func=self.acq_func_y_sigma,
+                verbose=self.verbose - 3)
+            with np.errstate(divide='ignore'):
+                for i in range(len(self.X) - 1, -1, -1):
+                    self.pool.add_one(
+                        self.X[i], self.y[i], self.sigma_y[i], self.acq_value[i])
+        share_attr(self,"pool")
+        return self.pool
+
+    def _parallel_rank_and_merge(
+            self, this_X, this_y, this_sigma_y, this_acq, n_points, gpr):
         # The size of the pool should be at least the amount of points to be acquired.
         # If running several processes in parallel, it can be reduced down to the number
         #   of points to be evaluated per process, but with less guarantee to find an
         #   optimal set.
-        if is_main_process:
-            start_rank = time()
-        self.acq_func_y_sigma = partial(
-            self.acq_func.f, baseline=gpr.y_max,
-            noise_level=gpr.noise_level, zeta=self.acq_func.zeta)
         self.pool = RankedPool(
             n_points, gpr=gpr, acq_func=self.acq_func_y_sigma, verbose= self.verbose-3)
         with np.errstate(divide='ignore'):
-            this_acq = self.acq_func_y_sigma(this_y, this_sigma_y)
             for i in range(len(this_X) - 1, -1, -1):
                 self.pool.add_one(this_X[i], this_y[i], this_sigma_y[i], this_acq[i])
-            merged_pool = self.merge_pools(n_points)
-            pool_acq = self.acq_func_y_sigma(
-                merged_pool.y[:n_points], merged_pool.sigma[:n_points])
-        sync_processes()
-        if is_main_process:
-            self.log(
-                f"({(time()-start_rank):.2g} sec) Ranked pool of candidates.")
-        return merged_pool.X[:n_points], merged_pool.y[:n_points], pool_acq
+            merged_pool = self._merge_pools(n_points)
+        return merged_pool
 
-    def mpi_gather_pools(self):
+    def _gather_pools(self):
         """
         Merges the points in all pools, discarding the empty ones.
 
@@ -837,7 +890,7 @@ class Griffins(GPAcquisition):
             return pool_X, pool_y, pool_sigma
         return None, None, None
 
-    def merge_pools(self, n_points):
+    def _merge_pools(self, n_points):
         """
         Merges the pools of parallel processes to find ``n_points`` optimal locations.
 
@@ -847,7 +900,7 @@ class Griffins(GPAcquisition):
         """
         if not multiple_processes:  # no need to merge and re-sort
             return self.pool
-        pool_X, pool_y, pool_sigma = self.mpi_gather_pools()
+        pool_X, pool_y, pool_sigma = self._gather_pools()
         merged_pool = None
         if is_main_process:
             merged_pool = self.pool.empty_copy()
