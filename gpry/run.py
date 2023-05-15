@@ -341,7 +341,8 @@ class Runner(object):
                          "the feature space. This may lead to slow convergence."
                          "Consider running it with less cores or decreasing "
                          "n_points_per_acq manually.", level=2)
-            elif self.n_points_per_acq < mpi_size:
+            elif (mpi_size > 1 and self.n_points_per_acq < mpi_size and
+                  self.n_points_per_acq < self.d):
                 self.log("Warning: parallellisation not fully utilised! It is advised to "
                          "make ``n_points_per_acq`` equal to the number of MPI processes "
                          "(default when not specified).", level=2)

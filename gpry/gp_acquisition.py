@@ -575,7 +575,7 @@ class Griffins(GPAcquisition):
         else:
             raise TypeError("acq_func needs to be an Acquisition_Function or "
                             f"'LogExp' or 'NonlinearLogExp', instead got {acq_func}")
-        self.acq_func_y_sigma = partial(self.acq_func.f, zeta=self.acq_func.zeta)
+        self.acq_func_y_sigma = None
         # Configure nested sampler
         self.polychord_settings = PolyChordSettings(nDims=self.n_d, nDerived=0)
         # Don't write unnecessary files: take lots of space and waste time
@@ -584,7 +584,10 @@ class Griffins(GPAcquisition):
         self.polychord_settings.write_live = False
         self.polychord_settings.write_dead = True
         self.polychord_settings.write_prior = True
-        self.polychord_settings.feedback = verbose
+        self.polychord_settings.feedback = verbose - 3
+        # 0: print header and result; not very useful: turn it to -1 if that's the case
+        if self.polychord_settings.feedback == 0:
+            self.polychord_settings.feedback = -1
         # Using rng state as seed for PolyChord
         if random_state is not None:
             self.polychord_settings.seed = \
@@ -599,6 +602,8 @@ class Griffins(GPAcquisition):
         # Pool for storing intermediate results during parallelised acquisition
         self.pool = None
         self.last_polychord_output = None
+        self.X, self.y, self.sigma_y = None, None, None
+        self.log_header = f"[ACQUISITION : {self.__class__.__name__}] "
 
     @property
     def pool_size(self):
@@ -631,7 +636,7 @@ class Griffins(GPAcquisition):
         always if ``level=None``.
         """
         if level is None or level <= self.verbose:
-            print(msg)
+            print(self.log_header + msg)
 
     def get_MC_sample(self, gpr, random_state=None, sampler="polychord"):
         """
@@ -746,12 +751,12 @@ class Griffins(GPAcquisition):
         # Gather an MC sample
         if is_main_process:
             start_sample = time()
-        if self.mc_every_i % self.mc_every:  # reuse
-            self.X, self.y, self.sigma_y = self.X, None, None
-            # TODO: implement reweighting!
-        else:
+        mc_sample_this_time = not bool(self.mc_every_i % self.mc_every)
+        if mc_sample_this_time:
             self.X, self.y, self.sigma_y = self.get_MC_sample(
                 gpr, random_state, sampler="polychord")
+        else:  # reuse
+            self.X, self.y, self.sigma_y = self.X, None, None
         self.mc_every_i += 1
         # Split for parallel processes (full arrays passed: a bit of overhead)
         X = mpi_comm.bcast(self.X)
@@ -780,7 +785,10 @@ class Griffins(GPAcquisition):
             this_sigma_y = sigma_y[i_this_process: i_this_process + n_this_process]
         sync_processes()
         if is_main_process:
-            self.log(f"[griffins] MC sampling took {time()-start_sample} seconds")
+            what_we_did = ("Obtained new MC sample" if mc_sample_this_time
+                           else "Re-evaluated previous MC sample")
+            self.log(
+                f"({(time()-start_sample):.2g} sec) {what_we_did}")
         # Rank to get best points
         # The size of the pool should be at least the amount of points to be acquired.
         # If running several processes in parallel, it can be reduced down to the number
@@ -788,98 +796,23 @@ class Griffins(GPAcquisition):
         #   optimal set.
         if is_main_process:
             start_rank = time()
-        self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma, verbose= self.verbose-3)
-        this_acq = self.acq_func_y_sigma(this_y, this_sigma_y, gpr.y_max, gpr.noise_level)
-        for i in range(len(this_X) - 1, -1, -1):
-            self.pool.add_one(this_X[i], this_y[i], this_sigma_y[i], this_acq[i])
+        self.acq_func_y_sigma = partial(
+            self.acq_func.f, baseline=gpr.y_max,
+            noise_level=gpr.noise_level, zeta=self.acq_func.zeta)
+        self.pool = RankedPool(
+            n_points, gpr=gpr, acq_func=self.acq_func_y_sigma, verbose= self.verbose-3)
+        with np.errstate(divide='ignore'):
+            this_acq = self.acq_func_y_sigma(this_y, this_sigma_y)
+            for i in range(len(this_X) - 1, -1, -1):
+                self.pool.add_one(this_X[i], this_y[i], this_sigma_y[i], this_acq[i])
+            merged_pool = self.merge_pools(n_points)
+            pool_acq = self.acq_func_y_sigma(
+                merged_pool.y[:n_points], merged_pool.sigma[:n_points])
         sync_processes()
         if is_main_process:
-            self.log(f"[griffins] Ranking took {time()-start_rank} seconds")
-        # MPI-merge and return
-        return self.get_optimal_locations(n_points)
-
-    def multi_add_OLD_WORKING(self, gpr, n_points=1, random_state=None):
-        r"""Method to query multiple points where the objective function
-        shall be evaluated.
-
-        The strategy which is used to query multiple points is by using
-        the :math:`f(x)\sim \mu(x)` strategy and and not changing the
-        hyperparameters of the model.
-
-        It runs PolyChord on the mean of the GP model, tracking the value
-        of the acquisition function at every evaluation, and keeping a
-        pool of candidates which is re-sorted whenever a new good candidate
-        is found.
-
-        When run in parallel (MPI), returns the same values for all processes.
-
-        Parameters
-        ----------
-        gpr : GaussianProcessRegressor
-            The GP Regressor which is used as surrogate model.
-
-        n_points : int, optional (default=1)
-            Number of points returned by the optimize method
-            If the value is 1, a single point to evaluate is returned.
-
-            Otherwise a list of points to evaluate is returned of size
-            n_points. This is useful if you can evaluate your objective
-            in parallel, and thus obtain more objective function evaluations
-            per unit of time.
-
-        random_state : int or numpy.RandomState, optional
-            The generator used to initialize the centers. If an integer is
-            given, it fixes the seed. Defaults to the global numpy random
-            number generator.
-
-        Returns
-        -------
-        X : numpy.ndarray, shape = (X_dim, n_points)
-            The X values of the found optima
-        y_lies : numpy.ndarray, shape = (n_points,)
-            The predicted values of the GP at the proposed sampling locations
-        fval : numpy.ndarray, shape = (n_points,)
-            The values of the acquisition function at X_opt
-        """
-        # Check if n_points is positive and an integer
-        if not (isinstance(n_points, int) and n_points > 0):
-            raise ValueError(f"n_points should be int > 0, got {n_points}")
-        # Reset pool of points to be computed
-        # The size of the pool should be at least the amount of points to be acquired.
-        # If running several processes in parallel, it can be reduced down to the number
-        #   of points to be evaluated per process, but with less guarantee to find an
-        #   optimal set.
-        self.pool = RankedPool(n_points, gpr=gpr, acq_func=self.acq_func_y_sigma, verbose = self.verbose-3)
-
-        # Initialise "likelihood" -- returns GPR value and deals with pooling/ranking
-        def logp(X):
-            """
-            Returns the predicted value at a given point (-inf if prior=0).
-            """
-            X = np.atleast_2d(X)
-            logp_pred, sigma_pred = gpr.predict(X, return_std=True, validate=False)
-            if sigma_pred[0] > 0:
-                self.pool.add_one(X, logp_pred[0], sigma_pred[0])
-            return logp_pred[0], []
-
-        # Update PolyChord precision settings
-        self.update_NS_precision(gpr)
-        from pypolychord import run_polychord  # pylint: disable=import-outside-toplevel
-        with NumpyErrorHandling(all="ignore") as _:
-            self.last_polychord_output = run_polychord(
-                logp,
-                nDims=self.n_d, nDerived=0,
-                settings=self.polychord_settings,
-                prior=self.prior)
-        dummy_paramnames = [tuple(2 * [f"x_{i + 1}"]) for i in range(gpr.d)]
-        self.last_polychord_output.make_paramnames_files(dummy_paramnames)
-        try:
-            self.mean = self.last_polychord_output.posterior.means
-            self.cov = self.last_polychord_output.posterior.cov()
-        except ValueError:
-            self.mean = None
-            self.cov = None
-        return self.get_optimal_locations(n_points)
+            self.log(
+                f"({(time()-start_rank):.2g} sec) Ranked pool of candidates.")
+        return merged_pool.X[:n_points], merged_pool.y[:n_points], pool_acq
 
     def mpi_gather_pools(self):
         """
@@ -901,9 +834,10 @@ class Griffins(GPAcquisition):
             pool_X = np.concatenate(pool_X)[i_notnan]
             pool_y = np.concatenate(pool_y)[i_notnan]
             pool_sigma = np.concatenate(pool_sigma)[i_notnan]
-        return pool_X, pool_y, pool_sigma
+            return pool_X, pool_y, pool_sigma
+        return None, None, None
 
-    def get_optimal_locations(self, n_points):
+    def merge_pools(self, n_points):
         """
         Merges the pools of parallel processes to find ``n_points`` optimal locations.
 
@@ -912,18 +846,14 @@ class Griffins(GPAcquisition):
         Acquisition values returned are *unconditional*.
         """
         if not multiple_processes:  # no need to merge and re-sort
-            pool_acq = self.acq_func_y_sigma(
-                self.pool.y[:n_points], self.pool.sigma[:n_points], self.pool.y_max, self.pool.noise_level)
-            return self.pool.X[:n_points], self.pool.y[:n_points], pool_acq
+            return self.pool
         pool_X, pool_y, pool_sigma = self.mpi_gather_pools()
         merged_pool = None
         if is_main_process:
             merged_pool = self.pool.empty_copy()
             merged_pool.add(pool_X, pool_y, pool_sigma)
         merged_pool = mpi_comm.bcast(merged_pool)
-        pool_acq = self.acq_func_y_sigma(
-            merged_pool.y[:n_points], merged_pool.sigma[:n_points], merged_pool.y_max, merged_pool.noise_level)
-        return merged_pool.X[:n_points], merged_pool.y[:n_points], pool_acq
+        return merged_pool
 
 
 class RankedPool():
@@ -960,8 +890,6 @@ class RankedPool():
         self._gpr = gpr
         self._acq_func = acq_func
         self.verbose = verbose
-        self.noise_level = self._gpr.noise_level
-        self.y_max = self._gpr.y_max
 
     def __len__(self):
         return len(self.y) - 1
@@ -1040,7 +968,7 @@ class RankedPool():
         # influence on the final order. It is also faster: fewer insertions into the pool.
         if y is None:
             y, sigma = self._gpr.predict(X, return_std=True, validate=False)
-        acq = self._acq_func(y, sigma, self.y_max, self.noise_level)
+        acq = self._acq_func(y, sigma)
         i_sort = np.argsort(acq)[::-1]  # descending order
         for i in i_sort:
             self.add_one(X[i], y[i], sigma[i], acq[i])
@@ -1130,7 +1058,7 @@ class RankedPool():
             # length is really huge. Also, when alpha or the noise level for two cached
             # models are different. We can just ignore it.
             # (Sometimes, it's just ~1e6 relative differences, which is not worrying)
-            acq_cond = min(acq_cond, self._acq_func(y, sigma_cond, self.y_max, self.noise_level))
+            acq_cond = min(acq_cond, self._acq_func(y, sigma_cond))
             self.log(
                 level=4,
                 msg=f"[pool.add] --> updated conditional acquisition: {self.acq[i_new]}")
@@ -1161,7 +1089,7 @@ class RankedPool():
             # Again, cond acq cannot be higher then less cond one.
             # In particular, keep -inf if it was so
             self.acq[i_new + 1:] = np.clip(
-                self._acq_func(self.y[i_new + 1:], sigmas_cond, self.y_max, self.noise_level),
+                self._acq_func(self.y[i_new + 1:], sigmas_cond),
                 a_min=None, a_max=self.acq[i_new + 1:])
         self.log(level=4, msg="[pool.add] Current unsorted pool:")
         self.log_pool(level=4, include_last=True)
