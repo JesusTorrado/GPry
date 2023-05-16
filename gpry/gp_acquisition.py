@@ -784,14 +784,14 @@ class Griffins(GPAcquisition):
         # TESTS UNDERWAY -- DO NOT CHANGE BETWEEN THESE COMMENTS -------------------------
         # sync_processes()
         # s = time()
-        # merged_pool = self._parallel_rank_and_merge(
+        merged_pool = self._parallel_rank_and_merge(
         #     this_X, this_y, this_sigma_y, this_acq, n_points, gpr)
         # if is_main_process:
         #     PARA = time() - s
         #     # print(merged_pool)
         # sync_processes()
         # s = time()
-        merged_pool = self._rank(n_points, gpr)
+        # merged_pool = self._rank(n_points, gpr)
         # if is_main_process:
         #     NOPA = time() - s
         #     # print(merged_pool)
