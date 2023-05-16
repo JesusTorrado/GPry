@@ -688,15 +688,16 @@ class Griffins(GPAcquisition):
             # tmpdir = tempfile.mkdtemp()
             self.polychord_settings.base_dir = tmpdir
             self.polychord_settings.file_root = "test"
+        share_attr(self, "polychord_settings")
         with NumpyErrorHandling(all="ignore") as _:
             self.last_polychord_output = run_polychord(
                 logp,
                 nDims=self.n_d, nDerived=0,
                 settings=self.polychord_settings,
                 prior=self.prior)
+        if is_main_process:
             dummy_paramnames = [tuple(2 * [f"x_{i + 1}"]) for i in range(gpr.d)]
             self.last_polychord_output.make_paramnames_files(dummy_paramnames)
-        if is_main_process:
             dead_T = np.loadtxt(self.last_polychord_output.root + "_dead.txt").T
             X = dead_T[1:].T
             y = dead_T[0]  # this one stores logp
