@@ -545,6 +545,7 @@ class Griffins(GPAcquisition):
                  num_repeats_per_dim=5,
                  precision_criterion_target=0.005,
                  nprior_per_nlive=10,
+                 tmpdir=None,
                  verbose=1):
         try:
             # pylint: disable=import-outside-toplevel
@@ -560,6 +561,8 @@ class Griffins(GPAcquisition):
         self.mc_every = int(mc_every)
         self.mc_every_i = 0
         self.use_prior_sample = use_prior_sample
+        self.tmpdir=tmpdir
+        self.i = 0
         if is_acquisition_function(acq_func):
             self.acq_func = acq_func
         elif acq_func == "LogExp":
@@ -675,8 +678,12 @@ class Griffins(GPAcquisition):
         self.update_NS_precision(gpr)
         from pypolychord import run_polychord  # pylint: disable=import-outside-toplevel
         if is_main_process:
-            # TODO: add to checkpoint folder?
-            tmpdir = tempfile.TemporaryDirectory().name
+            if self.tmpdir is None:
+                # TODO: add to checkpoint folder?
+                tmpdir = tempfile.TemporaryDirectory().name
+            else:
+                tmpdir = f"{self.tmpdir}/{self.i}"
+                self.i += 1
             # ALT: persistent folder:
             # tmpdir = tempfile.mkdtemp()
             self.polychord_settings.base_dir = tmpdir
