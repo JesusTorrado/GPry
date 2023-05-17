@@ -785,7 +785,7 @@ class Griffins(GPAcquisition):
         # sync_processes()
         # s = time()
         merged_pool = self._parallel_rank_and_merge(
-        #     this_X, this_y, this_sigma_y, this_acq, n_points, gpr)
+            this_X, this_y, this_sigma_y, this_acq, n_points, gpr)
         # if is_main_process:
         #     PARA = time() - s
         #     # print(merged_pool)
