@@ -460,11 +460,12 @@ class GPAcquisition(object):
         return False
 
 
-class Griffins(GPAcquisition):
+class NORA(GPAcquisition):
     """
-    Run Gaussian Process acquisition with Griffins.
+    Run Gaussian Process acquisition with NORA (Nested sampling Optimization for Ranked
+    Acquistion).
 
-    Uses krigging believer while it samples the acquisition function using nested
+    Uses kriging believer while it samples the acquisition function using nested
     sampling (with PolyChord).
 
     Parameters

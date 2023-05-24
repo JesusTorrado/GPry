@@ -7,7 +7,7 @@ from gpry.mpi import is_main_process
 from gpry.io import create_path
 
 # Path for saving plots, make sure it exists!
-checkpoint = None # "output/simple"
+checkpoint = None # "output/curved"
 
 # Building the likelihood
 from scipy.stats import multivariate_normal
@@ -47,12 +47,12 @@ if is_main_process:
 verbose = 3
 
 from gpry.preprocessing import Normalize_bounds
-from gpry.gp_acquisition import Griffins, GPAcquisition
-acquisition = Griffins(
+from gpry.gp_acquisition import NORA, GPAcquisition
+acquisition = NORA(
     model.prior.bounds(), acq_func="NonlinearLogExp",
     mc_every=model.prior.d(),
-   preprocessing_X=Normalize_bounds(model.prior.bounds()),
-   zeta_scaling=0.85, verbose=verbose)
+    preprocessing_X=Normalize_bounds(model.prior.bounds()),
+    zeta_scaling=0.85, verbose=verbose)
 #acquisition = GPAcquisition(
 #    model.prior.bounds(), proposer=None, acq_func="LogExp",
 #    acq_optimizer="fmin_l_bfgs_b",

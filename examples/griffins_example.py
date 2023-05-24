@@ -66,8 +66,8 @@ model = get_model(info)
 verbose = 3
 
 from gpry.preprocessing import Normalize_bounds
-from gpry.gp_acquisition import Griffins, GPAcquisition
-acquisition = Griffins(
+from gpry.gp_acquisition import NORA, GPAcquisition
+acquisition = NORA(
     model.prior.bounds(), acq_func="NonlinearLogExp",
    preprocessing_X=Normalize_bounds(model.prior.bounds()),
    zeta_scaling=0.85, verbose=verbose)

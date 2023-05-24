@@ -672,6 +672,7 @@ class Runner(object):
             if is_main_process and self.plots:
                 self.plot_progress()
         else:  # check "while" ending condition
+            sync_processes()
             if is_main_process:
                 lines = "Finished!\n"
                 if self.has_converged:
