@@ -323,6 +323,7 @@ class SVM(SVC):
             raise ValueError("All values that have been passed are infinite. "
                              "This cannot be tolerated as it breaks the GP.")
         else:
+            self.all_finite = False
             super().fit(self.X_train_, self.finite)
         return self.finite
 
