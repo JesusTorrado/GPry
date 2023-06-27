@@ -809,7 +809,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         # Reset newly_appended_for_inv to 0
         self.newly_appended_for_inv = 0
         return self
-
+    
     def predict(self, X, return_std=False, return_cov=False,
                 return_mean_grad=False, return_std_grad=False, validate=True):
         """
@@ -1056,13 +1056,13 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             c.n_eval_loglike = self.n_eval_loglike
         # Initialize the X_train and y_train part
         if hasattr(self, "X_train"):
-            c.X_train = self.X_train
+            c.X_train = np.copy(self.X_train)
         if hasattr(self, "y_train"):
-            c.y_train = self.y_train
+            c.y_train = np.copy(self.y_train)
         if hasattr(self, "X_train_"):
-            c.X_train_ = self.X_train_
+            c.X_train_ = np.copy(self.X_train_)
         if hasattr(self, "y_train_"):
-            c.y_train_ = self.y_train_
+            c.y_train_ = np.copy(self.y_train_)
         # Initialize noise levels
         if hasattr(self, "noise_level"):
             c.noise_level = self.noise_level
@@ -1072,11 +1072,11 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             c.alpha = self.alpha
         # Initialize kernel and inverse kernel
         if hasattr(self, "V_"):
-            c.V_ = self.V_
+            c.V_ = np.copy(self.V_)
         if hasattr(self, "L_"):
-            c.L_ = self.L_
+            c.L_ = np.copy(self.L_)
         if hasattr(self, "alpha_"):
-            c.alpha_ = self.alpha_
+            c.alpha_ = np.copy(self.alpha_)
         if hasattr(self, "kernel_"):
             c.kernel_ = deepcopy(self.kernel_)
         # Copy the right SVM
