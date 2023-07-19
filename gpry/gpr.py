@@ -333,6 +333,18 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
     # END OF DEPRECATION BLOCK
 
     @property
+    def X_train_infinite(self):
+        if self.account_for_inf is None:
+            return np.empty(shape=(0, self.d))
+        return self.account_for_inf.X_train[np.logical_not(self.account_for_inf.finite)]
+
+    @property
+    def y_train_infinite(self):
+        if self.account_for_inf is None:
+            return np.empty(shape=(0, self.d))
+        return self.account_for_inf.y_train[np.logical_not(self.account_for_inf.finite)]
+
+    @property
     def fitted(self):
         """Whether the GPR has been fitted at least once."""
         return self._fitted
