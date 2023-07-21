@@ -335,6 +335,7 @@ class Runner(object):
             self.n_points_per_acq = options.get("n_points_per_acq", min(mpi_size, self.d))
             self.fit_full_every = options.get(
                 "fit_full_every", max(int(2 * np.sqrt(self.d)), 1))
+            self.diagnosis = options.get("diagnosis", True)
             if self.n_points_per_acq > self.d:
                 self.log("Warning: The number kriging believer samples per "
                          "acquisition step is larger than the number of dimensions of "
@@ -380,7 +381,7 @@ class Runner(object):
                          "n_points_per_acq", "options", "acquisition",
                          "convergence_is_MPI_aware", "callback_is_MPI_aware",
                          "callback_is_single_arg", "loaded_from_checkpoint",
-                         "initial_proposer"):
+                         "initial_proposer", "diagnosis"):
                 share_attr(self, attr)
             self._share_gpr_from_main()
             # Only broadcast non-MPI-aware objects if necessary, to save trouble+memory
@@ -684,6 +685,8 @@ class Runner(object):
                     lines += ("- The maximum number of finite truth evaluations "
                               f"({self.max_finite}) has been reached.")
                 self.banner(lines)
+            if self.diagnosis:
+                self.diagnose()
         self.has_run = True
 
     def do_initial_training(self):
@@ -866,6 +869,37 @@ class Runner(object):
                                  convergence=self.convergence, output=output,
                                  add_options=add_options, resume=resume,
                                  verbose=self.verbose)
+    
+    def diagnose(self):
+        if is_main_process:
+            lines = "Starting diagnosis\n"
+            lines += "- Evaluating corners"
+            self.log(lines)
+            bounds = self.model.prior.bounds()
+            ndim = len(bounds)
+            mesh = np.meshgrid(*bounds)
+            corners = np.stack(mesh, axis=-1).reshape(-1, ndim)
+            # Evaluate GP at all corners
+            vals_in_corners = self.gpr.predict(corners, validate=False)
+            # Check if at any point it's overshooting
+            higher_than_max = vals_in_corners > self.gpr.y_max
+            if np.sum(higher_than_max) > 0:
+                lines = f"WARNING: found {np.sum(higher_than_max)} corners\n"
+                lines += "where the GP predicts a higher value than its\n"
+                lines += "maximum. Reevaluating those corners..."
+                self.log(lines)
+                # Filter the points where the high values are predicted and
+                # evaluate the posterior distribution there
+                points_to_evaluate = np.atleast_2d(corners[higher_than_max])
+                new_vals = np.empty(len(points_to_evaluate))
+                for i, p in enumerate(points_to_evaluate):
+                    new_vals[i] = self.model.logpost(p)
+                    self.gpr.append_to_data(points_to_evaluate, new_vals,
+                            fit=True)
+                self._share_gpr_from_main()
+                # self.save_checkpoint()
+                self.log("...done.")
+        
 
     def plot_mc(self, surr_info, sampler, add_training=True, add_samples=None,
         output=None):
