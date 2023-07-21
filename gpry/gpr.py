@@ -322,18 +322,27 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             return self.n
 
     # DEPRECATED ON 2022-09-70
+    # RAISES ERROR SINCE 2023-07-19
     @property
     def n_total_evals(self):
-        warnings.warn("This property will soon be deprecated in favour of ``n_total``. "
-                      "Please, change your code accordingly.")
-        return self.n_total
+        raise AttributeError("This has been deprecated in favour of ``n_total``.")
 
     @property
     def n_accepted_evals(self):
-        warnings.warn("This property will soon be deprecated in favour of ``n``. "
-                      "Please, change your code accordingly.")
-        return self.n
+        raise AttributeError("This has been deprecated in favour of ``n``.")
     # END OF DEPRECATION BLOCK
+
+    @property
+    def X_train_infinite(self):
+        if self.account_for_inf is None:
+            return np.empty(shape=(0, self.d))
+        return self.account_for_inf.X_train[np.logical_not(self.account_for_inf.finite)]
+
+    @property
+    def y_train_infinite(self):
+        if self.account_for_inf is None:
+            return np.empty(shape=(0, self.d))
+        return self.account_for_inf.y_train[np.logical_not(self.account_for_inf.finite)]
 
     @property
     def fitted(self):

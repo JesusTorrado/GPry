@@ -901,8 +901,8 @@ class Runner(object):
                 self.log("...done.")
         
 
-    def plot_mc(self, surr_info, sampler, add_training=True, add_samples=None,
-        output=None):
+    def plot_mc(self, surr_info_or_sample_folder, sampler=None, add_training=True,
+                add_samples=None, output=None):
         """
         Creates a triangle plot of an MC sample of the surrogate model, and optionally
         shows some evaluation locations.
@@ -921,7 +921,7 @@ class Runner(object):
             Whether the training locations are plotted on top of the contours.
 
         add_samples : dict(label, getdist.MCSamples), optional (default=None)
-            Whether the training locations are plotted on top of the contours.
+            Extra getdist.MCSamples objects to be added to the plot.
 
         output : str or os.path, optional (default=None)
             The location to save the generated plot in. If ``None`` it will be saved in
@@ -931,11 +931,18 @@ class Runner(object):
         if not is_main_process:
             return
         self.ensure_paths(plots=True)
-        from getdist.mcsamples import MCSamplesFromCobaya
+        if isinstance(surr_info_or_sample_folder, str):
+            root = os.path.abspath(surr_info_or_sample_folder)
+            if os.path.isdir(root):
+                root += "/"  # to force GetDist to treat it as folder, not prefix
+            from getdist.mcsamples import loadMCSamples
+            gdsamples_gp = loadMCSamples(root)
+        else:  # passed surr_info, sampler
+            gdsamples_gp = sampler.products(
+                to_getdist=True, combined=True, skip_samples=0.33)["sample"]
         import getdist.plots as gdplt
         from gpry.plots import getdist_add_training
         import matplotlib.pyplot as plt
-        gdsamples_gp = MCSamplesFromCobaya(surr_info, sampler.products()["sample"])
         gdplot = gdplt.get_subplot_plotter(width_inch=5)
         to_plot = [gdsamples_gp]
         if add_samples:

@@ -13,7 +13,8 @@ from gpry.tools import (
 )
 
 
-def getdist_add_training(getdist_plot, model, gpr, colormap="viridis", marker="."):
+def getdist_add_training(getdist_plot, model, gpr, colormap="viridis",
+                         marker=".", marker_inf="x"):
     """
     Adds the training points to a GetDist triangle plot, coloured according to
     their log-posterior value.
@@ -36,6 +37,9 @@ def getdist_add_training(getdist_plot, model, gpr, colormap="viridis", marker=".
     marker : matplotlib marker, optional (default=".")
         Marker to be used for the training points.
 
+    marker_inf : matplotlib marker, optional (default=".")
+        Marker to be used for the non-finite training points.
+
     Returns
     -------
     The GetDist triangle plot with the added training points.
@@ -54,22 +58,30 @@ def getdist_add_training(getdist_plot, model, gpr, colormap="viridis", marker=".
             bounds[j] = ax.get_ylim()
     # Now reduce the set of points to the ones within ranges
     # (needed to get good limits for the colorbar of the log-posterior)
-    Xs = np.copy(gpr.X_train)
-    ys = np.copy(gpr.y_train)
+    Xs_finite = np.copy(gpr.X_train)
+    ys_finite = np.copy(gpr.y_train)
+    Xs_infinite = np.copy(gpr.X_train_infinite)
     for i, (mini, maxi) in enumerate(bounds):
-        i_within = np.argwhere(np.logical_and(mini < Xs[:, i], Xs[:, i] < maxi))
-        Xs = np.atleast_2d(np.squeeze(Xs[i_within]))
-        ys = np.atleast_1d(np.squeeze(ys[i_within]))
-    if not len(Xs):  # no points within plotting ranges
+        i_within_finite = np.argwhere(
+            np.logical_and(mini < Xs_finite[:, i], Xs_finite[:, i] < maxi))
+        Xs_finite = np.atleast_2d(np.squeeze(Xs_finite[i_within_finite]))
+        ys_finite = np.atleast_1d(np.squeeze(ys_finite[i_within_finite]))
+        i_within_infinite = np.argwhere(
+            np.logical_and(mini < Xs_infinite[:, i], Xs_infinite[:, i] < maxi))
+        Xs_infinite = np.atleast_2d(np.squeeze(Xs_infinite[i_within_infinite]))
+    if not len(Xs_finite) and not len(Xs_infinite):  # no points within plotting ranges
         return
     # Create colormap with appropriate limits
     matplotlib.cm.get_cmap(colormap)
-    norm = matplotlib.colors.Normalize(vmin=min(ys), vmax=max(ys))
+    norm = matplotlib.colors.Normalize(vmin=min(ys_finite), vmax=max(ys_finite))
     # Add points
     for (i, j), ax in ax_dict.items():
-        points = Xs[:, [i, j]]
-        ax.scatter(*points.T, marker=marker, c=norm(ys), alpha=0.3)
-
+        if len(Xs_finite):
+            points_finite = Xs_finite[:, [i, j]]
+            ax.scatter(*points_finite.T, marker=marker, c=norm(ys_finite), alpha=0.3)
+        if len(Xs_infinite):
+            points_infinite = Xs_infinite[:, [i, j]]
+            ax.scatter(*points_infinite.T, marker=marker_inf, c="k", alpha=0.3)
     # TODO: actually add colorbar (see GetDist add_colorbar method)
     return getdist_plot
 
