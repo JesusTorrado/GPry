@@ -460,6 +460,131 @@ class GPAcquisition(object):
         return False
 
 
+
+class Thompson(GPAcquisition):
+    """
+
+    """
+    def __init__(self, bounds,
+                 acq_func="LogExp",
+                 random_state=None,
+                 zeta_scaling=0.85,
+                 zeta=None,
+                 beta = 1.0,
+                 mu_init = 0.0,
+                 sigma_init = 0.5,
+                 n_subdivisions = 10,
+                 fit_threshold = 25,
+                 update_freq = 5,
+                 verbose=1):
+        self.bounds = np.array(bounds)
+        self.n_d = np.shape(bounds)[0]
+
+        if is_acquisition_function(acq_func):
+            self.acq_func = acq_func
+        elif acq_func == "LogExp":
+            # If the LogExp acquisition function is chosen it's zeta is set
+            # automatically using the dimensionality of the prior.
+            self.acq_func = LogExp(
+                dimension=self.n_d, zeta=zeta, zeta_scaling=zeta_scaling)
+        elif acq_func == "NonlinearLogExp":
+            # If the LogExp acquisition function is chosen it's zeta is set
+            # automatically using the dimensionality of the prior.
+            self.acq_func = NonlinearLogExp(
+                dimension=self.n_d, zeta=zeta, zeta_scaling=zeta_scaling)
+        else:
+            raise TypeError("acq_func needs to be an Acquisition_Function or "
+                            f"'LogExp' or 'NonlinearLogExp', instead got {acq_func}")
+
+        self.n_subdivisions = n_subdivisions
+
+        self.mu_init = mu_init
+        self.sigma_init = sigma_init
+        self.fit_threshold = fit_threshold
+        self.update_freq = update_freq
+
+        self.interval = [np.linspace(self.bounds[i][0],self.bounds[i][1],num=self.n_subdivisions) for i in range(len(self.bounds))]
+        if isinstance(self.interval, list):
+            self.mesh = np.meshgrid(*self.interval)
+        elif isinstance(self.interval, np.ndarray):
+            self.mesh = np.meshgrid(*[self.interval] * self.n_d)
+
+        self.X_grid = np.column_stack(list(map(np.ravel, self.mesh)))
+        print([x.shape for x in self.interval], self.bounds.shape, [x.shape for x in self.mesh], self.X_grid.shape)
+
+        self.mu = np.array([self.mu_init] * self.X_grid.shape[0])
+        self.sigma = np.array([self.sigma_init] * self.X_grid.shape[0])
+        self.beta = beta
+        self.t = 0  # Number of times we have sampled
+        self.N = np.zeros_like(
+            self.mu
+        )  # number of times we sampled a given X for time t
+        self.X = []
+        self.y = []
+        self.log_header = f"[ACQUISITION : {self.__class__.__name__}] "
+
+    def log(self, msg, level=None):
+        """
+        Print a message if its verbosity level is equal or lower than the given one (or
+        always if ``level=None``.
+        """
+        if level is None or level <= self.verbose:
+            print(self.log_header + msg)
+
+    def sample(self):
+        # --- START Thompson strategy code ---
+        if len(self.X) < self.fit_threshold:
+            grid_idx = np.random.randint(self.X_grid.shape[0])
+        else:
+            self.t += 1
+            beta = self.beta * np.sqrt(1 + self.t * np.log(self.t) ** 2 / np.maximum(self.N, 1))
+            grid_idx = (self.mu.flatten() + self.sigma.flatten() * np.sqrt(beta)).argmax()
+
+        self.N[grid_idx] += 1
+        params = self.X_grid[grid_idx]
+        return params
+
+    def update(self, reward, params):
+        self.X.append(params)
+        self.y.append(reward)
+        if len(self.X) < self.fit_threshold or len(self.X) % self.update_freq != 0:
+            return
+        self.gp_update()
+
+    def gp_update(self):
+        self.gp = self.gp.fit(self.X, self.y)
+        self.mu, self.sigma = self.gp.predict(self.X_grid, return_std=True)
+        # --- END Thompson strategy code ---
+
+    def multi_add(self, gpr, n_points=1, random_state=None):
+        r"""Method to query multiple points where the objective function
+        shall be evaluated.
+        """
+        # Check if n_points is positive and an integer
+        if not (isinstance(n_points, int) and n_points > 0):
+            raise ValueError(f"n_points should be int > 0, got {n_points}")
+        # Gather an MC sample
+        if is_main_process:
+            start_sample = time()
+
+        self.gp = gpr
+        self.X,self.y = gpr.X_train, gpr.y_train
+        self.gp_update()
+        self.acq_func_y_sigma = partial(
+            self.acq_func.f, baseline=gpr.y_max,
+            noise_level=gpr.noise_level, zeta=self.acq_func.zeta)
+
+        # --- START Thompson sampling code ---
+        results = []
+        for ipoint in range(n_points):
+          x = self.sample()
+          y, sigma = gpr.predict(np.atleast_2d(x),return_std=True)
+          acq = self.acq_func_y_sigma(y,sigma)
+          results.append([x,y,acq])
+        # --- END Thompson sampling code ---
+        return np.array([r[0] for r in results]), np.array([r[1] for r in results]), np.array([r[2] for r in results])
+
+
 class NORA(GPAcquisition):
     """
     Run Gaussian Process acquisition with NORA (Nested sampling Optimization for Ranked
