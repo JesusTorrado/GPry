@@ -2,7 +2,7 @@
 import dill
 from mpi4py import MPI
 import numpy as np
-from numpy.random import SeedSequence, default_rng
+from numpy.random import SeedSequence, default_rng, Generator
 
 # Use dill pickler (can seriealize more stuff, e.g. lambdas)
 MPI.pickle.__init__(dill.dumps, dill.loads)
@@ -22,9 +22,12 @@ def get_random_state(seed=None):
     Parameters
     ----------
 
-    seed : int or numpy seed, optional (default=None)
-        A random seed to use. If none is provided a random one will be drawn.
+    seed : int or numpy seed, or numpy.random.Generator, optional (default=None)
+        A random seed to initialise a Generator, or a Generator to be used directly.
+        If none is provided a random one will be drawn.
     """
+    if isinstance(seed, Generator):
+        return seed
     if is_main_process:
         ss = SeedSequence(seed)
         child_seeds = ss.spawn(mpi_size)
@@ -41,7 +44,6 @@ def split_number_for_parallel_processes(n, n_proc=mpi_size):
 
     Parameters
     ----------
-
     n : int
         The number of atomic tasks
     n_proc : int, optional (default=number of MPI comm's)
@@ -49,7 +51,6 @@ def split_number_for_parallel_processes(n, n_proc=mpi_size):
 
     Returns
     -------
-
     An array with the number of tasks corresponding each process.
     """
     n_rounded_to_nproc = int(np.ceil(n / n_proc)) * n_proc
@@ -61,17 +62,17 @@ def split_number_for_parallel_processes(n, n_proc=mpi_size):
 
 def multi_gather_array(arrs):
     """
-    Gathers (possibly a list of) arrays from all processes into the main process
+    Gathers (possibly a list of) arrays from all processes into the main process.
+
+    NB: mpi-gather guarantees rank order is preserved.
 
     Parameters
     ----------
-
     arrs : array-like
         The arrays to gather
 
     Returns
     -------
-
     The gathered array(s) from all processes
     """
     if not isinstance(arrs, (list, tuple)):

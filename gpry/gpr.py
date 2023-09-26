@@ -2,10 +2,12 @@
 import warnings
 from copy import deepcopy
 from operator import itemgetter
+from typing import Mapping
 
 # numpy and scipy
 import numpy as np
-from scipy.linalg import cholesky, solve_triangular
+from scipy.linalg import cholesky, solve_triangular, cho_solve
+from scipy.linalg.blas import dtrmm as tri_mul
 import scipy.optimize
 
 # gpry kernels and SVM
@@ -44,17 +46,18 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
 
     Parameters
     ----------
-    kernel : kernel object, optional (default: "RBF")
+    kernel : kernel object, string, dict, optional (default: "RBF")
         The kernel specifying the covariance function of the GP. If
         "RBF"/"Matern" is passed, the asymmetric kernel::
 
-            ConstantKernel(1, [0.001, 10000]) * RBF/Matern([0.01]*n_dim, "dynamic")
+            ConstantKernel() * RBF/Matern()
 
         is used as default where ``n_dim`` is the number of dimensions of the
         training space. In this case you will have to provide the prior bounds
         as the ``bounds`` parameter to the GP. For the Matern kernel
-        :math:`\nu=3/2`. Note that the kernel's hyperparameters are optimized
-        during fitting.
+        :math:`\nu=3/2`. To pass different arguments to the kernel, e.g. ``nu=5/2``
+        for Matern, pass a single-key dict as ``{"Matern": {"nu": 2.5}}"``. Note
+        that the kernel's hyperparameters are optimized during fitting.
 
     noise_level : float or array-like, optional (default: 1e-2)
         Square-root of the value added to the diagonal of the kernel matrix
@@ -167,18 +170,13 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         The kernel used for prediction. The structure of the kernel is the
         same as the one passed as parameter but with optimized hyperparameters.
 
-    K_inv_ : array-like, shape = (n_samples, n_samples)
-        The inverse of the Kernel matrix of the training data. Needed at
-        prediction.
-
     alpha_ : array-like, shape = (n_samples, n_samples)
         **Not to be confused with alpha!** The inverse Kernel matrix of the
         training points multiplied with ``y_train_`` (Dual coefficients of
         training data points in kernel space). Needed at prediction.
-        .
 
-    L_ : array-like, shape = (n_samples, n_samples)
-        Lower-triangular Cholesky decomposition of the kernel in ``X_train_``
+    V_ : array-like, shape = (n_samples, n_samples)
+        Lower-triangular Cholesky decomposition of the inverse kernel in ``X_train_``
 
         .. warning::
 
@@ -234,9 +232,15 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
 
         # Auto-construct inbuilt kernels
         if isinstance(kernel, str):
+            kernel = {kernel: {}}
+        if isinstance(kernel, Mapping):
+            if len(kernel) != 1:
+                raise ValueError("'kernel' must be a single-key dict.")
+            kernel_name = list(kernel)[0]
+            kernel_args = kernel[kernel_name] or {}
             if self.bounds is None:
                 raise ValueError("You selected used the automatically "
-                                 f"constructed '{kernel}' kernel without "
+                                 f"constructed '{kernel_name}' kernel without "
                                  "specifying prior bounds.")
             # Transform prior bounds if neccessary
             if self.preprocessing_X is not None:
@@ -244,18 +248,17 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             else:
                 self.bounds_ = self.bounds
             # Check if it's a supported kernel
-            if kernel not in ["RBF", "Matern"]:
-                raise ValueError("Currently only 'RBF' and 'Matern' are "
-                                 f"supported as standard kernels. Got {kernel}")
+            try:
+                length_corr_kernel = {"rbf": RBF, "matern": Matern}[kernel_name.lower()]
+            except KeyError as excpt:
+                raise ValueError(
+                    "Currently only 'RBF' and 'Matern' are "
+                    f"supported as standard kernels. Got '{kernel_name}'."
+                ) from excpt
             # Build kernel
-            elif kernel == "RBF":
-                kernel = C(1.0, [0.001, 10000]) \
-                    * RBF([0.01] * self.d, "dynamic",
-                          prior_bounds=self.bounds_)
-            elif kernel == "Matern":
-                kernel = C(1.0, [0.001, 10000]) \
-                    * Matern([0.01] * self.d, "dynamic",
-                             prior_bounds=self.bounds_)
+            kernel = C(1.0, [0.001, 10000]) \
+                * length_corr_kernel([0.01] * self.d, "dynamic",
+                                     prior_bounds=self.bounds_, **kernel_args)
 
         super(GaussianProcessRegressor, self).__init__(
             kernel=kernel, alpha=noise_level**2., optimizer=optimizer,
@@ -266,18 +269,17 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         if self.verbose >= 3:
             print("Initializing GP with the following options:")
             print("===========================================")
-            print("Kernel:")
-            if kernel == "RBF":
-                # TODO: fix this!
-                print("ConstantKernel(1, [0.001, 10000])"
-                      " * RBF([0.01]*n_dim, 'dynamic')")
-            else:
-                print(self.kernel.hyperparameters)
-            print("Optimizer restarts: %i" % n_restarts_optimizer)
-            print("X-preprocessor: %s" % (preprocessing_X is not None))
-            print("y-preprocessor: %s" % (preprocessing_y is not None))
-            print("SVM to account for infinities: %s"
-                  % (account_for_inf is not None))
+            print("* Kernel:")
+            print("   ", self.kernel)
+            print("  with hyperparameters:")
+            for h in self.kernel.hyperparameters:
+                print("    -", h)
+            print(f"* Noise level: {noise_level}")
+            print(f"* Optimizer: {optimizer}")
+            print(f"* Optimizer restarts: {n_restarts_optimizer}")
+            print(f"* X-preprocessor: {preprocessing_X is not None}")
+            print(f"* y-preprocessor: {preprocessing_y is not None}")
+            print(f"* SVM to account for infinities: {bool(account_for_inf)}")
 
     @property
     def d(self):
@@ -325,19 +327,17 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         else:
             return self.n
 
-    # DEPRECATED ON 2022-09-70
     @property
-    def n_total_evals(self):
-        warnings.warn("This property will soon be deprecated in favour of ``n_total``. "
-                      "Please, change your code accordingly.")
-        return self.n_total
+    def X_train_infinite(self):
+        if self.account_for_inf is None:
+            return np.empty(shape=(0, self.d))
+        return self.account_for_inf.X_train[np.logical_not(self.account_for_inf.finite)]
 
     @property
-    def n_accepted_evals(self):
-        warnings.warn("This property will soon be deprecated in favour of ``n``. "
-                      "Please, change your code accordingly.")
-        return self.n
-    # END OF DEPRECATION BLOCK
+    def y_train_infinite(self):
+        if self.account_for_inf is None:
+            return np.empty(shape=(0, self.d))
+        return self.account_for_inf.y_train[np.logical_not(self.account_for_inf.finite)]
 
     @property
     def fitted(self):
@@ -382,7 +382,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             self.account_for_inf.random_state = check_random_state(
                 random_state, convert_to_random_state=True)
 
-    def append_to_data(self, X, y, noise_level=None, fit=True, simplified_fit=False):
+    def append_to_data(self, X, y, noise_level=None, fit=True, simplified_fit=False, hyperparameter_bounds=None):
         r"""Append newly acquired data to the GP Model and updates it.
 
         Here updating refers to the re-calculation of
@@ -447,7 +447,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
                 warnings.warn("No model has previously been fit to the data, "
                               "a model will be fit with X and y instead of just "
                               "updating with the same kernel hyperparameters")
-            self.fit(X, y, noise_level=noise_level)
+            self.fit(X, y, noise_level=noise_level, hyperparameter_bounds=hyperparameter_bounds)
             return self
 
         if self.account_for_inf is not None:
@@ -526,7 +526,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         self.newly_appended_for_inv = y.shape[0]
 
         if fit:
-            self.fit(simplified=simplified_fit)
+            self.fit(simplified=simplified_fit, hyperparameter_bounds=hyperparameter_bounds)
         else:
             if self.preprocessing_X is not None:
                 X = self.preprocessing_X.transform(X)
@@ -593,21 +593,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             # independent of actual query points
             K = self.kernel_(self.X_train_)
             K[np.diag_indices_from(K)] += self.alpha
-            try:
-                self.L_ = cholesky(K, lower=True)  # Line 2
-                # self.L_ changed, self.K_inv_ needs to be recomputed
-                L_inv = solve_triangular(self.L_.T, np.eye(self.L_.shape[0]))
-                self.K_inv_ = L_inv.dot(L_inv.T)
-            except np.linalg.LinAlgError as exc:
-                exc.args = ("The kernel, %s, is not returning a "
-                            "positive definite matrix. Try gradually "
-                            "increasing the 'noise_level' parameter of your "
-                            "GaussianProcessRegressor estimator."
-                            % self.kernel_) + exc.args
-                raise
-            self.alpha_ = self.K_inv_ @ self.y_train_
-            # Just here if stuff doesnt work, needs to be removed later...
-            # self.alpha_ = cho_solve((self.L_, True), self.y_train_)  # Line 3
+            self._kernel_inverse(K)
         return self
 
     # Wrapper around log_marginal_likelihood to count the number of evaluations
@@ -615,7 +601,8 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         self.n_eval_loglike += 1
         return super().log_marginal_likelihood(*args, **kwargs)
 
-    def fit(self, X=None, y=None, noise_level=None, simplified=False):
+    def fit(self, X=None, y=None, noise_level=None, simplified=False,
+            hyperparameter_bounds=None):
         r"""Optimizes the hyperparameters :math:`\theta` for the training data
         given. The algorithm used to perform the optimization is very similar
         to the one provided by Scikit-learn. The only major difference is, that
@@ -733,10 +720,11 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
                     return -self.log_marginal_likelihood(theta,
                                                          clone_kernel=False)
             # First optimize starting from theta specified in kernel
-            bounds = self.kernel_.bounds
+            if hyperparameter_bounds is None:
+                hyperparameter_bounds = self.kernel_.bounds
             optima = [(self._constrained_optimization(obj_func,
                                                       self.kernel_.theta,
-                                                      bounds))]
+                                                      hyperparameter_bounds))]
 
             # Additional runs are performed from log-uniform chosen initial theta
             if self.n_restarts_optimizer > 0 and not simplified:
@@ -746,10 +734,11 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
                         "requires that all bounds are finite.")
                 for iteration in range(self.n_restarts_optimizer):
                     theta_initial = \
-                        self._rng.uniform(bounds[:, 0], bounds[:, 1])
+                        self._rng.uniform(hyperparameter_bounds[:, 0],
+                                          hyperparameter_bounds[:, 1])
                     optima.append(
                         self._constrained_optimization(obj_func, theta_initial,
-                                                       bounds))
+                                                       hyperparameter_bounds))
             # Select result from run with minimal (negative) log-marginal
             # likelihood
             lml_values = list(map(itemgetter(1), optima))
@@ -766,21 +755,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         # of actual query points
         K = self.kernel_(self.X_train_)
         K[np.diag_indices_from(K)] += self.alpha
-        try:
-            self.L_ = cholesky(K, lower=True)  # Line 2
-            # self.L_ changed, self.K_inv_ needs to be recomputed
-            L_inv = solve_triangular(self.L_.T, np.eye(self.L_.shape[0]))
-            self.K_inv_ = L_inv.dot(L_inv.T)
-        except np.linalg.LinAlgError as exc:
-            exc.args = ("The kernel, %s, is not returning a "
-                        "positive definite matrix. Try gradually "
-                        "increasing the 'alpha' parameter of your "
-                        "GaussianProcessRegressor estimator."
-                        % self.kernel_,) + exc.args
-            raise
-        self.alpha_ = self.K_inv_ @ self.y_train_
-        # leave this here if stuff doesnt work...
-        # self.alpha_ = cho_solve((self.L_, True), self.y_train_)  # Line 3
+        self._kernel_inverse(K)
 
         # Reset newly_appended_for_inv to 0
         self.newly_appended_for_inv = 0
@@ -804,7 +779,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         self
         """
         # Check if a model has previously been fit to the data, i.e. that a
-        # K_inv_matrix, X_train_ and y_train_ exist. Furthermore check, that
+        # V_, X_train_ and y_train_ exist. Furthermore check, that
         # newly_appended_for_inv > 0.
 
         if self.newly_appended_for_inv < 1:
@@ -820,29 +795,26 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             raise ValueError("y_train_ is missing. Most probably the model "
                              "hasn't been fit to the data previously.")
 
-        if getattr(self, "K_inv_", None) is None:
-            raise ValueError("K_inv_ is missing. Most probably the model "
+        if getattr(self, "V_", None) is None:
+            raise ValueError("V_ is missing. Most probably the model "
                              "hasn't been fit to the data previously.")
 
-        if self.K_inv_.shape[0] != self.y_train_.size - self.newly_appended_for_inv:
+        if self.V_.shape[0] != self.y_train_.size - self.newly_appended_for_inv:
             raise ValueError("The number of added points doesn't match the "
-                             "dimensions of the K_inv matrix. %s != %s"
-                             % (self.K_inv_.shape[0],
+                             "dimensions of the V_ matrix. %s != %s"
+                             % (self.V_.shape[0],
                                 self.y_train_.size - self.newly_appended_for_inv))
 
         kernel = self.kernel_(self.X_train_)
         kernel[np.diag_indices_from(kernel)] += self.alpha
-        self.K_inv_ = np.linalg.inv(kernel)
-
-        # Also update alpha_ matrix
-        self.alpha_ = self.K_inv_ @ self.y_train_
+        self._kernel_inverse(kernel)
 
         # Reset newly_appended_for_inv to 0
         self.newly_appended_for_inv = 0
         return self
 
     def predict(self, X, return_std=False, return_cov=False,
-                return_mean_grad=False, return_std_grad=False, do_check_array=True):
+                return_mean_grad=False, return_std_grad=False, validate=True):
         """
         Predict output for X.
 
@@ -868,10 +840,11 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             Whether or not to return the gradient of the std.
             Only valid when X is a single point.
 
-        do_check_array : bool, default: True
-            If False, ``X`` is assumed to be correctly formatted, and no checks are
-            performed on it. Reduces overhead. Use only for repeated calls when the input
-            is programmatically generated to be correct at each stage.
+        validate : bool, default: True
+            If False, ``X`` is assumed to be correctly formatted (2-d float array, with
+            points as rows and dimensions/features as columns, C-contiguous), and no
+            checks are performed on it. Reduces overhead. Use only for repeated calls when
+            the input is programmatically generated to be correct at each stage.
 
         .. note::
 
@@ -910,9 +883,9 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             raise ValueError("Mean grad and std grad not implemented \
                 for n_samples > 1")
 
-        if do_check_array and (self.kernel is None or self.kernel.requires_vector_input):
+        if validate and (self.kernel is None or self.kernel.requires_vector_input):
             X = check_array(X, ensure_2d=True, dtype="numeric")
-        elif do_check_array:
+        elif validate:
             X = check_array(X, ensure_2d=False, dtype=None)
 
         if not hasattr(self, "X_train_"):  # Not fit; predict based on GP prior
@@ -950,7 +923,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             y_std_full = np.zeros(n_samples)  # std is zero when mu is -inf
             grad_mean_full = np.ones((n_samples, n_dims))
             grad_std_full = np.zeros((n_samples, n_dims))
-            finite = self.account_for_inf.predict(X)
+            finite = self.account_for_inf.predict(X, validate=validate)
             # If all values are infinite there's no point in running the
             # prediction through the GP
             if np.all(~finite):
@@ -990,11 +963,11 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             y_mean = y_mean_full
 
         if return_std:
-            K_inv = self.K_inv_
+            M = tri_mul(1., self.V_, K_trans.T, lower=True)
 
             # Compute variance of predictive distribution
             y_var = self.kernel_.diag(X)
-            y_var -= np.einsum("ki,kj,ij->k", K_trans, K_trans, K_inv)
+            y_var -= np.einsum("ji,ji->i", M, M, optimize=True)
             # np.einsum("ij,ij->i", np.dot(K_trans, K_inv), K_trans)
             # np.einsum("ki,kj,ij->k", K_trans, K_trans, K_inv)
 
@@ -1002,7 +975,7 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             # numerical issues. If yes: set the variance to 0.
             y_var_negative = y_var < 0
             if np.any(y_var_negative):
-                if self.verbose > 1:
+                if self.verbose > 4:
                     warnings.warn("Predicted variances smaller than 0. "
                                   "Setting those variances to 0.")
                 y_var[y_var_negative] = 0.0
@@ -1036,8 +1009,9 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             if return_std_grad:
                 grad_std = np.zeros(X.shape[1])
                 if not np.allclose(y_std, grad_std):
+                    # TODO: This can be made much more efficient, but I don't think it's used currently
                     grad_std = -np.dot(K_trans,
-                                       np.dot(K_inv, grad))[0] \
+                                       np.dot(self.V_.T.dot(self.V_), grad))[0] \
                         / y_std_untransformed
                     # Undo normalization
                     if self.preprocessing_y is not None:
@@ -1083,13 +1057,13 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
             c.n_eval_loglike = self.n_eval_loglike
         # Initialize the X_train and y_train part
         if hasattr(self, "X_train"):
-            c.X_train = self.X_train
+            c.X_train = np.copy(self.X_train)
         if hasattr(self, "y_train"):
-            c.y_train = self.y_train
+            c.y_train = np.copy(self.y_train)
         if hasattr(self, "X_train_"):
-            c.X_train_ = self.X_train_
+            c.X_train_ = np.copy(self.X_train_)
         if hasattr(self, "y_train_"):
-            c.y_train_ = self.y_train_
+            c.y_train_ = np.copy(self.y_train_)
         # Initialize noise levels
         if hasattr(self, "noise_level"):
             c.noise_level = self.noise_level
@@ -1098,14 +1072,14 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
         if hasattr(self, "alpha"):
             c.alpha = self.alpha
         # Initialize kernel and inverse kernel
+        if hasattr(self, "V_"):
+            c.V_ = np.copy(self.V_)
         if hasattr(self, "L_"):
-            c.L_ = self.L_
+            c.L_ = np.copy(self.L_)
         if hasattr(self, "alpha_"):
-            c.alpha_ = self.alpha_
-        if hasattr(self, "K_inv_"):
-            c.K_inv_ = self.K_inv_
+            c.alpha_ = np.copy(self.alpha_)
         if hasattr(self, "kernel_"):
-            c.kernel_ = self.kernel_
+            c.kernel_ = deepcopy(self.kernel_)
         # Copy the right SVM
         if hasattr(self, "account_for_inf"):
             c.account_for_inf = deepcopy(self.account_for_inf)
@@ -1137,3 +1111,17 @@ class GaussianProcessRegressor(sk_GaussianProcessRegressor, BE):
                 raise ValueError("Unknown optimizer %s." % self.optimizer)
 
         return theta_opt, func_min
+
+    def _kernel_inverse(self, kernel):
+        """ Compute inverse of the kernel and store relevant quantities"""
+        try:
+            self.L_ = cholesky(kernel, lower=True)
+            self.V_ = solve_triangular(self.L_, np.eye(self.L_.shape[0]),lower=True)
+        except np.linalg.LinAlgError as exc:
+            exc.args = ("The kernel, %s, is not returning a "
+                        "positive definite matrix. Try gradually "
+                        "increasing the 'noise_level' parameter of your "
+                        "GaussianProcessRegressor estimator."
+                        % self.kernel_) + exc.args
+            raise
+        self.alpha_ = cho_solve((self.L_, True), self.y_train_)

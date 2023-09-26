@@ -1,8 +1,9 @@
 import os
 import warnings
-import numpy as np
 from copy import deepcopy
 from inspect import getfullargspec
+from typing import Mapping
+import numpy as np
 
 from cobaya.model import Model
 
@@ -11,7 +12,9 @@ from gpry.mpi import mpi_comm, mpi_size, mpi_rank, is_main_process, get_random_s
 from gpry.proposal import InitialPointProposer, ReferenceProposer, PriorProposer, \
     UniformProposer
 from gpry.gpr import GaussianProcessRegressor
-from gpry.gp_acquisition import GPAcquisition
+from gpry.gp_acquisition import GenericGPAcquisition
+import gpry.gp_acquisition as gprygpacqs
+import gpry.acquisition_functions as gpryacqfuncs
 from gpry.svm import SVM
 from gpry.preprocessing import Normalize_bounds, Normalize_y
 import gpry.convergence as gpryconv
@@ -25,7 +28,7 @@ from gpry.tools import create_cobaya_model
 _plots_path = "images"
 
 
-class Runner(object):
+class Runner():
     r"""
     Class that takes care of constructing the Bayesian quadrature/likelihood
     characterization loop. After initialisation, the algorithm can be launched with
@@ -48,35 +51,37 @@ class Runner(object):
         ``{"prior": [min, max], "latex": [label]}``. It does not need to be defined (will
         be ignored) if a Cobaya ``Model`` instance is passed as ``model``.
 
-    gpr : GaussianProcessRegressor, "RBF" or "Matern", optional (default="RBF")
+    gpr : GaussianProcessRegressor, str, dict, optional (default="RBF")
         The GP used for interpolating the posterior. If None or "RBF" is given
         a GP with a constant kernel multiplied with an anisotropic RBF kernel
         and dynamic bounds is generated. The same kernel with a Matern 3/2
         kernel instead of a RBF is generated if "Matern" is passed. This might
-        be useful if the posterior is not very smooth.
-        Otherwise a custom GP regressor can be created and passed.
+        be useful if the posterior is not very smooth. Otherwise a custom GP regressor can
+        be defined as a dict containing the arguments of ``GaussianProcessRegressor``, or
+        passing an already initialized instance.
 
-    gp_acquisition : GPAcquisition, optional (default="LogExp")
-        The acquisition object. If None is given the LogExp acquisition
-        function is used (with the :math:`\zeta` value chosen automatically
+    gp_acquisition : GenericGPAcquisition, optional (default="LogExp")
+        The acquisition object. If None is given the BatchOptimizer with a LogExp
+        acquisition function is used (with the :math:`\zeta` value chosen automatically
         depending on the dimensionality of the prior) and the GP's X-values are
         preprocessed to be in the uniform hypercube before optimizing the
-        acquistion function.
+        acquistion function. It can also be passed an initialized instance, or a dict with
+        arguments with which to initialize one.
 
-    initial_proposer : str or InitialPointProposer (default="reference")
+    initial_proposer : InitialPointProposer, str, dict, optional (default="reference")
         Proposer used for drawing the initial training samples before running the
         Bayesian optimisation loop. As standard the samples are drawn from the model
         reference (prior if no reference is specified). Alternative options which can be
         passed as strings are ``"prior", "uniform"``. The ``"reference"`` proposer
-        defaults to the prior if no reference distribution is provided.
+        defaults to the prior if no reference distribution is provided. If defined as a
+        dict with the proposer name as single key, the values will be passed as kwargs to
+        the proposer.
 
-    convergence_criterion : Convergence_criterion, optional (default="CorrectCounter")
+    convergence_criterion : ConvergenceCriterion, str, dict, optional (default="CorrectCounter")
         The convergence criterion. If None is given the Correct counter convergence
-        criterion is used with a relative threshold of 0.01 and an absolute threshold of
-        0.05.
-
-    convergence_options : dict, optional (default=None)
-        optional parameters passed to the convergence criterion.
+        criterion is used with adaptive relative and absoluter thresholds. Can be
+        specified as a dict to initialize a ConvergenceCriterion class with some
+        arguments, or directly as an instance of ConvergenceCriterion.
 
     options : dict, optional (default=None)
         A dict containing all options regarding the bayesian optimization loop.
@@ -99,15 +104,6 @@ class Runner(object):
               convergence criterion, specifying exactly how many points you want to have
               in your GP. If you set this limit by hand and find that it is easily
               saturated, try decreasing the volume of your prior (default: max_total).
-            * zeta_scaling : scaling of the :math:`\zeta` parameter in the exponential
-              acquisition function with the number of dimensions :math:`\zeta=1/d^x`
-              where :math:`x` is the scaling parameter. The standard value is 0.85.
-
-              .. note::
-
-                  This value is overwritten if a
-                  :class:`GPAcquisition <gp_acquisition.GPAcquisition>` object is passed
-                  instead of a string for ``gp_acquisition``.
 
     callback : callable, optional (default=None)
         Function run each iteration after adapting the recently acquired points and
@@ -151,7 +147,7 @@ class Runner(object):
         This can be used to call an MCMC sampler for getting marginalized
         properties. This is the most crucial component.
 
-    gp_acquisition : GPAcquisition
+    gp_acquisition : GenericGPAcquisition
         The acquisition object that was used for the active sampling procedure.
 
     convergence_criterion : Convergence_criterion
@@ -169,11 +165,25 @@ class Runner(object):
         value of the convergence criterion.
     """
 
-    def __init__(self, model=None, bounds=None, gpr="RBF", gp_acquisition="LogExp",
-                 convergence_criterion="CorrectCounter", callback=None,
-                 callback_is_MPI_aware=False, convergence_options=None, options={},
+    def __init__(self,
+                 model=None,
+                 bounds=None,
+                 gpr="RBF",
+                 gp_acquisition="LogExp",
                  initial_proposer="reference",
-                 checkpoint=None, load_checkpoint=None, seed=None, plots=True, verbose=3):
+                 convergence_criterion="CorrectCounter",
+                 callback=None,
+                 callback_is_MPI_aware=False,
+                 options=None,
+                 checkpoint=None,
+                 load_checkpoint=None,
+                 seed=None,
+                 plots=False,
+                 verbose=3,
+                 # DEPRECATED ON 13-09-2023:
+                 convergence_options=None,
+                 ):
+        self.verbose = verbose
         if model is None:
             if not (checkpoint is not None and str(load_checkpoint).lower() == "resume"):
                 raise ValueError(
@@ -189,18 +199,18 @@ class Runner(object):
         if self.checkpoint is not None:
             self.plots_path = os.path.join(self.checkpoint, _plots_path)
             if is_main_process:
-                create_path(self.checkpoint, verbose=verbose >= 3)
+                create_path(self.checkpoint, verbose=self.verbose >= 3)
                 if plots:
-                    create_path(self.plots_path, verbose=verbose >= 3)
+                    create_path(self.plots_path, verbose=self.verbose >= 3)
         else:
             self.plots_path = _plots_path
             if plots and is_main_process:
-                create_path(self.plots_path, verbose=verbose >= 3)
+                create_path(self.plots_path, verbose=self.verbose >= 3)
         self.plots = plots
-        self.verbose = verbose
+        self.ensure_paths(plots=self.plots)
         self.random_state = get_random_state(seed)
         if is_main_process:
-            self.options = options
+            self.options = options or {}
             # Check if a checkpoint exists already and if so resume from there
             self.loaded_from_checkpoint = False
             if checkpoint is not None:
@@ -212,7 +222,7 @@ class Runner(object):
                     checkpoint_files = check_checkpoint(checkpoint)
                     self.loaded_from_checkpoint = np.all(checkpoint_files)
                     if self.loaded_from_checkpoint:
-                        self.read_checkpoint()
+                        self.read_checkpoint(model=model)
                         # Overwrite internal parameters by those loaded from checkpoint.
                         model, gpr, gp_acquisition, convergence_criterion, options = \
                             self.model, self.gpr, self.acquisition, self.convergence, \
@@ -236,104 +246,50 @@ class Runner(object):
                     raise TypeError("'model' needs to be a likelihood function or a "
                                     f"Cobaya model. got {model!r}")
             try:
-                prior_bounds = self.model.prior.bounds(confidence_for_unbounded=0.99995)
+                self.prior_bounds = self.model.prior.bounds(
+                    confidence_for_unbounded=0.99995)
             except Exception as excpt:
                 raise RuntimeError("There seems to be something wrong with "
-                                   f"the model instance: {excpt}")
-            # Construct initial_proposer if not already constructed
-            if isinstance(initial_proposer, str):
-                if initial_proposer not in ["reference", "prior", "uniform"]:
-                    raise ValueError("Supported standard initial point proposers are"
-                                     "'reference', 'prior', 'uniform', got"
-                                     f" {initial_proposer}")
-                elif initial_proposer == "reference":
-                    self.initial_proposer = ReferenceProposer(self.model)
-                elif initial_proposer == "prior":
-                    self.initial_proposer = PriorProposer(self.model)
-                elif initial_proposer == "uniform":
-                    self.initial_proposer = UniformProposer(prior_bounds)
-            else:
-                if not isinstance(initial_proposer, InitialPointProposer):
-                    raise TypeError("initial_proposer should be an InitialPointProposer"
-                                    " object, 'reference', 'prior' or 'uniform', got "
-                                    f"{initial_proposer}.")
-
-            # Construct GP if it's not already constructed
-            if isinstance(gpr, str):
-                if gpr not in ["RBF", "Matern"]:
-                    raise ValueError("Supported standard kernels are 'RBF' "
-                                     f"and Matern, got {gpr}")
-                self.gpr = GaussianProcessRegressor(
-                    kernel=gpr,
-                    n_restarts_optimizer=10 + 2 * self.d,
-                    preprocessing_X=Normalize_bounds(prior_bounds),
-                    preprocessing_y=Normalize_y(),
-                    bounds=prior_bounds,
-                    verbose=verbose,
-                    random_state=self.random_state
+                                   f"the model instance: {excpt}") from excpt
+            # Construct the main loop elements:
+            # GPR, GPAcquisition, InitialProposer and ConvergenceCriterion
+            # DEPRECATED ON 13-09-2023:
+            if convergence_options is not None and isinstance(convergence_criterion, str):
+                self.log(
+                    "*Warning*: 'convergence_options' has been deprecated. You can "
+                    "now speficy arguments for the convergence criterion passing it "
+                    "as a dict, e.g. 'convergence_criterion={\"CorrectCounter\": "
+                    "{\"kwarg\": value}'. Your arguments have been passed, but this "
+                    "will fail in the future."
                 )
-            elif not isinstance(gpr, GaussianProcessRegressor):
-                raise TypeError("gpr should be a GP regressor, 'RBF' or 'Matern'"
-                                f", got {gpr}")
-            else:
-                self.gpr = gpr
-            # Construct the acquisition object if it's not already constructed
-            if isinstance(gp_acquisition, str):
-                if gp_acquisition not in ["LogExp", "NonlinearLogExp"]:
-                    raise ValueError("Supported acquisition function is 'LogExp', "
-                                     f"'NonlinearLogExp', got {gp_acquisition}")
-                self.acquisition = GPAcquisition(
-                    prior_bounds, proposer=None, acq_func=gp_acquisition,
-                    acq_optimizer="fmin_l_bfgs_b",
-                    n_restarts_optimizer=5 * self.d, n_repeats_propose=10,
-                    preprocessing_X=Normalize_bounds(prior_bounds),
-                    zeta_scaling=options.get("zeta_scaling", 0.85), verbose=verbose)
-            elif isinstance(gp_acquisition, GPAcquisition):
-                self.acquisition = gp_acquisition
-            else:
-                raise TypeError(
-                    "gp_acquisition should be an Acquisition object or "
-                    f"'LogExp', or 'NonlinearLogExp', got {gp_acquisition}")
-            # Construct the convergence criterion
-            if isinstance(convergence_criterion, str):
-                try:
-                    conv_class = getattr(gpryconv, convergence_criterion)
-                except AttributeError:
-                    raise ValueError(
-                        f"Unknown convergence criterion {convergence_criterion}. "
-                        f"Available convergence criteria: {gpryconv.builtin_names()}")
-                self.convergence = conv_class(self.model.prior, convergence_options or {})
-            elif isinstance(convergence_criterion, gpryconv.ConvergenceCriterion):
-                self.convergence = convergence_criterion
-            else:
-                raise TypeError("convergence_criterion should be a "
-                                "Convergence_criterion object or an instance of "
-                                f"{gpryconv.builtin_names()}, got "
-                                f"{convergence_criterion}")
-            self.convergence_is_MPI_aware = self.convergence.is_MPI_aware
+                convergence_criterion = {convergence_criterion: convergence_options}
+            zeta_scaling = (options or {}).pop("zeta_scaling", None)
+            if zeta_scaling is not None:
+                self.log(
+                    "*Warning*: Passing 'zeta_scaling' as part of the 'options' has been "
+                    "deprecated. It should be passed as a key of the 'acq_func' dict "
+                    "the GPAcquisition specification, e.g. '{\"BatchOptimizer\": "
+                    "{\"acq_func\": {\"zeta_scaling\": 0.85}}}'. The given 'zeta_scaling'"
+                    " is being used, but this will fail in the future."
+                )
+                if isinstance(gp_acquisition, str):
+                    gp_acquisition = {gp_acquisition: {"zeta_scaling": zeta_scaling}}
+            # END OF DEPRECATION BLOCK
+            self._construct_gpr(gpr)
+            self._construct_gp_acquisition(gp_acquisition)
+            self._construct_initial_proposer(initial_proposer)
+            self._construct_convergence_criterion(convergence_criterion)
+
+
+
+
             # Read in options for the run
             if options is None:
                 self.log(
                     "No options dict found. Defaulting to standard parameters.", level=3)
                 options = {}
             self.n_initial = options.get("n_initial", 3 * self.d)
-            # DEPRECATED ON 2022-07-28
-            if "max_init" in options:
-                warnings.warn("`max_init` will soon be deprecated "
-                              "in favour of `max_initial`.")
-                options["max_initial"] = options.pop("max_init")
-            # END OF DEPRECATION BLOCK
             self.max_initial = options.get("max_initial", 10 * self.d * self.n_initial)
-            # DEPRECATED ON 2022-07-28
-            if "max_points" in options:
-                warnings.warn("`max_points` will soon be deprecated "
-                              "in favour of `max_total`.")
-                options["max_total"] = options.pop("max_points")
-            if "max_accepted" in options:
-                warnings.warn("`max_accepted` will soon be deprecated "
-                              "in favour of `max_finite`.")
-                options["max_finite"] = options.pop("max_accepted")
-            # END OF DEPRECATION BLOCK
             self.max_total = options.get("max_total", int(70 * self.d**1.5))
             self.max_finite = options.get("max_finite", self.max_total)
             self.n_points_per_acq = options.get("n_points_per_acq", min(mpi_size, self.d))
@@ -345,7 +301,8 @@ class Runner(object):
                          "the feature space. This may lead to slow convergence."
                          "Consider running it with less cores or decreasing "
                          "n_points_per_acq manually.", level=2)
-            elif self.n_points_per_acq < mpi_size:
+            elif (self.n_points_per_acq < mpi_size and self.n_points_per_acq < mpi_size and
+                  self.n_points_per_acq < self.d):
                 self.log("Warning: parallellisation not fully utilised! It is advised to "
                          "make ``n_points_per_acq`` equal to the number of MPI processes "
                          "(default when not specified).", level=2)
@@ -365,25 +322,19 @@ class Runner(object):
                 raise ValueError("The maximum number of initial truth evaluations needs "
                                  "to be smaller than the maximum total number of "
                                  "evaluations.")
+            # Diagnosis
+            self.diagnosis = options.get("diagnosis", None)
             # Callback
             self.callback = callback
             self.callback_is_MPI_aware = callback_is_MPI_aware
-            # DEPRECATED ON 2022-07-28
-            self.callback_is_single_arg = (callable(callback) and
-                                           len(getfullargspec(callback).args) == 1)
-            if self.callback is not None and not self.callback_is_single_arg:
-                warnings.warn("callback functions should from now on take the Runner "
-                              "instance as a single argument. The multiple-arguments "
-                              "definition will be deprecated in the future.")
-            # END OF DEPRECATION BLOCK
             # Print resume
             self.log("Initialized GPry.", level=3)
         if multiple_processes:
             for attr in ("n_initial", "max_initial", "max_total", "max_finite",
                          "n_points_per_acq", "options", "acquisition",
                          "convergence_is_MPI_aware", "callback_is_MPI_aware",
-                         "callback_is_single_arg", "loaded_from_checkpoint",
-                         "initial_proposer"):
+                         "loaded_from_checkpoint", "initial_proposer", "progress",
+                         "diagnosis"):
                 share_attr(self, attr)
             self._share_gpr_from_main()
             # Only broadcast non-MPI-aware objects if necessary, to save trouble+memory
@@ -405,6 +356,150 @@ class Runner(object):
         self.current_iteration = 0
         self.has_run = False
         self.has_converged = False
+        self.old_gpr, self.new_X, self.new_y, self.y_pred = None, None, None, None
+        self.mean, self.cov = None, None
+
+    def _construct_gpr(self, gpr):
+        """Constructs or passes the GPR."""
+        if isinstance(gpr, GaussianProcessRegressor):
+            self.gpr = gpr
+        elif isinstance(gpr, (Mapping, str)):
+            if isinstance(gpr, str):
+                gpr = {"kernel": gpr}
+            gpr_defaults = {
+                "kernel": "RBF",
+                "n_restarts_optimizer": 10 + 2 * self.d,
+                "preprocessing_X": Normalize_bounds(self.prior_bounds),
+                "preprocessing_y": Normalize_y(),
+                "bounds": self.prior_bounds,
+                "random_state": self.random_state,
+                "verbose": self.verbose,
+            }
+            for k, value in gpr_defaults.items():
+                if gpr.get(k) is None:
+                    gpr[k] = value
+            try:
+                self.gpr = GaussianProcessRegressor(**gpr)
+            except ValueError as excpt:
+                raise ValueError(
+                    f"Error when initializing the GP regressor: {str(excpt)}"
+                ) from excpt
+        else:
+            raise TypeError(
+                "'gpr' should be a GP regressor, a dict of arguments for the GPR, "
+                "or a string specifying the kernel ('RBF' or 'Matern'). Got {gpr}"
+            )
+
+    def _construct_gp_acquisition(self, gp_acquisition):
+        """Constructs or passes the GPAcquisition instance."""
+        default_gq_acquisition = "BatchOptimizer"
+        if isinstance(gp_acquisition, GenericGPAcquisition):
+            self.acquisition = gp_acquisition
+        elif isinstance(gp_acquisition, (Mapping, str)) or gp_acquisition is None:
+            if gp_acquisition is None:
+                gp_acquisition = {default_gq_acquisition: {}}
+            elif isinstance(gp_acquisition, str):
+                gp_acquisition = {gp_acquisition: {}}
+            # If an acq_func name was passed, use the standard batch-optimization one
+            if list(gp_acquisition)[0] in gpryacqfuncs.builtin_names():
+                gp_acquisition = {
+                    default_gq_acquisition: {"acq_func": {list(gp_acquisition)[0]: {}}}}
+            gp_acquisition_name = list(gp_acquisition)[0]
+            gp_acquisition_args = gp_acquisition[gp_acquisition_name] or {}
+            gp_acquisition_defaults = {
+                "bounds": self.prior_bounds,
+                "preprocessing_X": Normalize_bounds(self.prior_bounds),
+                "random_state": self.random_state,
+                "acq_func": {"LogExp": {"zeta_scaling": 0.85}},
+                "verbose": self.verbose,
+            }
+            for k, value in gp_acquisition_defaults.items():
+                if gp_acquisition_args.get(k) is None:
+                    gp_acquisition_args[k] = value
+            try:
+                gp_acquisition_class = getattr(gprygpacqs, gp_acquisition_name)
+            except AttributeError as excpt:
+                raise ValueError(
+                    f"Unknown GPAcquisiton class {gp_acquisition_name}. "
+                    f"Available GPAcquisition classes: {gprygpacqs.builtin_names()}"
+                ) from excpt
+            try:
+                self.acquisition = gp_acquisition_class(**gp_acquisition_args)
+            except Exception as excpt:
+                raise ValueError(
+                    "Error when initialising the GPAcquisition object "
+                    f"{gp_acquisition_name} with arguments {gp_acquisition_args}: "
+                    f"{str(excpt)}"
+                ) from excpt
+        else:
+            raise TypeError(
+                "'gp_acquisition' should be a GPAcquisition object, "
+                "or a dict or string specification for one of "
+                f"{gprygpacqs.builtin_names()}. Got {gp_acquisition}"
+            )
+
+    def _construct_initial_proposer(self, initial_proposer):
+        """Constructs or passes the initial proposer."""
+        if isinstance(initial_proposer, InitialPointProposer):
+            self.intial_proposer = initial_proposer
+        elif isinstance(initial_proposer, (Mapping, str)):
+            if isinstance(initial_proposer, str):
+                initial_proposer = {initial_proposer: {}}
+            initial_proposer_name = list(initial_proposer)[0]
+            initial_proposer_args = initial_proposer[initial_proposer_name]
+            if initial_proposer_name.lower() == "reference":
+                self.initial_proposer = ReferenceProposer(
+                    self.model, **initial_proposer_args)
+            elif initial_proposer_name.lower() == "prior":
+                self.initial_proposer = PriorProposer(
+                    self.model, **initial_proposer_args)
+            elif initial_proposer_name.lower() == "uniform":
+                self.initial_proposer = UniformProposer(
+                    self.prior_bounds, **initial_proposer_args)
+            else:
+                raise ValueError(
+                    "Supported standard initial point proposers are "
+                    f"'reference', 'prior', 'uniform'. Got {initial_proposer}")
+        else:
+            raise TypeError(
+                "'initial_proposer' should be an InitialPointProposer instance, a "
+                "dict specification, or one of 'reference', 'prior' or 'uniform'. "
+                f" Got {initial_proposer}"
+            )
+
+    def _construct_convergence_criterion(self, convergence_criterion):
+        """Constructs or passes the convergence criterion."""
+        if isinstance(convergence_criterion, gpryconv.ConvergenceCriterion):
+            self.convergence = convergence_criterion
+        elif isinstance(convergence_criterion, (Mapping, str)):
+            if isinstance(convergence_criterion, str):
+                convergence_criterion = {convergence_criterion: {}}
+            convergence_name = list(convergence_criterion)[0]
+            convergence_args = convergence_criterion[convergence_name] or {}
+            try:
+                convergence_class = getattr(gpryconv, convergence_name)
+            except AttributeError as excpt:
+                raise ValueError(
+                    f"Unknown convergence criterion {convergence_name}. "
+                    f"Available convergence criteria: {gpryconv.builtin_names()}"
+                ) from excpt
+            try:
+                self.convergence = convergence_class(
+                    self.model.prior, convergence_args)
+            except Exception as excpt:
+                raise ValueError(
+                    "Error when initialising the convergence criterion "
+                    f"{convergence_name} with arguments {convergence_args}: "
+                    f"{str(excpt)}"
+                ) from excpt
+        else:
+            raise TypeError(
+                "'convergence_criterion' should be a ConvergenceCriterion instance, "
+                "or a dict or string specification for one of "
+                f"{gpryconv.builtin_names()}. Got {convergence_criterion}"
+            )
+        # This attr allows *not* to have to share the convergence criterion
+        self.convergence_is_MPI_aware = self.convergence.is_MPI_aware
 
     @property
     def d(self):
@@ -418,6 +513,16 @@ class Runner(object):
         """
         if level is None or level <= self.verbose:
             print(msg)
+
+    def ensure_paths(self, plots=True):
+        """
+        Creates paths for checkpoint and plots.
+        """
+        if is_main_process:
+            if self.checkpoint:
+                create_path(self.checkpoint, verbose=self.verbose >= 3)
+            if plots:
+                create_path(self.plots_path, verbose=self.verbose >= 3)
 
     @property
     def n_total_left(self):
@@ -450,13 +555,18 @@ class Runner(object):
                 footer = default_header_footer
             self.log(max_line_length * str(footer), level=level)
 
-    def read_checkpoint(self):
+    def read_checkpoint(self, model=None):
         """
         Loads checkpoint files to be able to resume a run or save the results for
         further processing.
+
+        Parameters
+        ----------
+        model : cobaya.model.Model, optional
+            If passed, it will be used instead of the loaded one.
         """
         self.model, self.gpr, self.acquisition, self.convergence, self.options, \
-            self.progress = read_checkpoint(self.checkpoint)
+            self.progress = read_checkpoint(self.checkpoint, model=model)
 
     def save_checkpoint(self):
         """
@@ -518,6 +628,7 @@ class Runner(object):
             self.old_gpr = deepcopy(self.gpr)
             self.progress.add_current_n_truth(self.gpr.n_total, self.gpr.n_finite)
             # Acquire new points in parallel
+            sync_processes()  # to sync the timer
             with TimerCounter(self.gpr) as timer_acq:
                 new_X, y_pred, acq_vals = self.acquisition.multi_add(
                     self.gpr, n_points=self.n_points_per_acq, random_state=self.random_state)
@@ -528,11 +639,11 @@ class Runner(object):
                 self.log("New location(s) proposed, as [X, logp_gp(X), acq(X)]:", level=4)
                 for X, y, acq in zip(new_X, y_pred, acq_vals):
                     self.log(f"   {X} {y} {acq}", level=4)
-            sync_processes()
             # Get logposterior value(s) for the acquired points (in parallel)
             new_X_this_process = new_X[
                 i_evals_this_process: i_evals_this_process + n_evals_this_process]
             new_y_this_process = np.empty(0)
+            sync_processes()  # to sync the timer
             with Timer() as timer_truth:
                 for x in new_X_this_process:
                     self.log(f"[{mpi_rank}] Evaluating true posterior at {x}", level=4)
@@ -563,20 +674,29 @@ class Runner(object):
             sync_processes()
             # Add the newly evaluated truths to the GPR, and maye refit hyperparameters
             if is_main_process:
-                do_simplified_fit = (self.current_iteration % self.fit_full_every != \
-                                     self.fit_full_every - 1)
+                kwargs_append = {}
+                kwargs_append["simplified_fit"] = \
+                    (self.current_iteration % self.fit_full_every !=
+                     self.fit_full_every - 1)
+                if self.cov is not None:
+                    stds = np.sqrt(np.diag(self.cov))
+                    prior_bounds = self.model.prior.bounds(confidence_for_unbounded=0.99995)
+                    relative_stds = stds / (prior_bounds[:, 1] - prior_bounds[:, 0])
+                    new_bounds = np.array([relative_stds / 2,  relative_stds * 2]).T
+                    kwargs_append["hyperparameter_bounds"] = self.gpr.kernel_.bounds.copy()
+                    kwargs_append["hyperparameter_bounds"][1:] = np.log(new_bounds)
                 with TimerCounter(self.gpr) as timer_fit:
                     self.gpr.append_to_data(new_X, new_y,
-                                            fit=True, simplified_fit=do_simplified_fit)
+                                            fit=True, **kwargs_append)
                 self.progress.add_fit(timer_fit.time, timer_fit.evals_loglike)
             if is_main_process:
-                hyperparams_or_not = "*not* " if do_simplified_fit else ""
+                hyperparams_or_not = "*not* " if kwargs_append["simplified_fit"] else ""
                 self.log(f"[FIT] ({timer_fit.time:.2g} sec) Fitted GP model with new "
                          "acquired points, "
                          f"{hyperparams_or_not}including GPR hyperparameters. "
-                         f"{self.gpr.n_last_appended_finite} finite points were added to "
+                         f"{(self.gpr.n_last_appended_finite if sum(np.isfinite(new_y)) else 0)} finite points were added to "
                          "the GPR.", level=3)
-                self.log(f"Current GPR kernel: {self.gpr.kernel_}", level=4)
+                self.log(f"Current GPR kernel: {self.gpr.kernel_}", level=2)
             self._share_gpr_from_main()
             sync_processes()
             # share new_X, new_y and y_pred to the runner instance
@@ -589,22 +709,8 @@ class Runner(object):
             # Use a with statement to pass an MPI communicator (dummy if MPI_aware=False)
             if self.callback:
                 if self.callback_is_MPI_aware or is_main_process:
-                    # DEPRECATED ON 2022-07-28 -- remove `else` clause
-                    if self.callback_is_single_arg:
-                        args = [self]
-                    else:
-                        # TODO: not ideal: duplicates memory innecessarily
-                        acquisition = mpi_comm.bcast(
-                            self.acquisition if is_main_process else None)
-                        if not self.convergence_is_MPI_aware:
-                            convergence = mpi_comm.bcast(
-                                self.convergence if is_main_process else None)
-                        args = [self.model, self.gpr, acquisition, convergence,
-                                self.options, self.progress,
-                                self.old_gpr, self.new_X, self.new_y, self.y_pred]
-                    # END OF DEPRECATION BLOCK
                     with Timer() as timer_callback:
-                        self.callback(*args)
+                        self.callback(self)
                     if is_main_process:
                         self.log(f"[CALLBACK] ({timer_callback.time:.2g} sec) Evaluated "
                                  "the callback function.", level=3)
@@ -646,11 +752,14 @@ class Runner(object):
                          f"{self.convergence.last_value:.2g} (limit "
                          f"{self.convergence.thres[-1]:.2g}).", level=3)
             sync_processes()
+            # TODO: uncomment for mean and cov updates (cov would be used for corr.length)
+            # self.update_mean_cov()
             self.progress.mpi_sync()
             self.save_checkpoint()
             if is_main_process and self.plots:
                 self.plot_progress()
         else:  # check "while" ending condition
+            sync_processes()
             if is_main_process:
                 lines = "Finished!\n"
                 if self.has_converged:
@@ -662,6 +771,8 @@ class Runner(object):
                     lines += ("- The maximum number of finite truth evaluations "
                               f"({self.max_finite}) has been reached.")
                 self.banner(lines)
+            if self.diagnosis:
+                self.diagnose()
         self.has_run = True
 
     def do_initial_training(self):
@@ -707,6 +818,7 @@ class Runner(object):
             np.ceil(self.max_initial / n_to_sample_per_process))
         # Initial samples loop. The initial samples are drawn from the prior
         # and according to the distribution of the prior.
+        sync_processes()  # to sync the timer
         with Timer() as timer_truth:
             for i in range(n_iterations_before_giving_up):
                 X_init_loop = np.empty((0, self.d))
@@ -733,7 +845,7 @@ class Runner(object):
                     # Only finite values contributes to the number of initial samples
                     n_finite_new = sum(is_finite(y_init - max(y_init)))
                     # Break loop if the desired number of initial samples is reached
-                    finished = (n_finite_new >= n_still_needed)
+                    finished = n_finite_new >= n_still_needed
                 if multiple_processes:
                     finished = mpi_comm.bcast(finished if is_main_process else None)
                 if finished:
@@ -749,7 +861,7 @@ class Runner(object):
                      f", of which {sum(is_finite(y_init - max(y_init)))} returned a "
                      f"finite value." +
                      (" Each MPI process evaluated at most "
-                      f"{max([len(p) for p in all_points])} locations."
+                      f"{max(len(p) for p in all_points)} locations."
                       if multiple_processes else ""), level=3)
         if is_main_process:
             # Raise error if the number of initial samples hasn't been reached
@@ -771,13 +883,27 @@ class Runner(object):
         self._share_gpr_from_main()
         self.progress.mpi_sync()
 
+    def update_mean_cov(self):
+        """
+        Updates and shares mean and cov if available, checking GPAcquisition first, and
+        Convergence second if not present in GPAcquisition.
+        """
+        for attr in ["mean", "cov"]:
+            if is_main_process:
+                value = getattr(self.acquisition, attr, None)
+                if value is None:
+                    value = getattr(self.convergence, attr, None)
+                setattr(self, attr, value)
+            share_attr(self, attr)
+
     def plot_progress(self):
         """
         Creates some progress plots and saves them at path (assumes path exists).
         """
         if not is_main_process:
             return
-        import matplotlib.pyplot as plt
+        self.ensure_paths(plots=True)
+        import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
         self.progress.plot_timing(
             truth=False, save=os.path.join(self.plots_path, "timing.svg"))
         self.progress.plot_evals(save=os.path.join(self.plots_path, "evals.svg"))
@@ -830,8 +956,39 @@ class Runner(object):
                                  add_options=add_options, resume=resume,
                                  verbose=self.verbose)
 
-    def plot_mc(self, surr_info, sampler, add_training=True, add_samples=None,
-        output=None):
+    def diagnose(self):
+        if is_main_process:
+            lines = "Starting diagnosis\n"
+            lines += "- Evaluating corners"
+            self.log(lines)
+            bounds = self.model.prior.bounds()
+            ndim = len(bounds)
+            mesh = np.meshgrid(*bounds)
+            corners = np.stack(mesh, axis=-1).reshape(-1, ndim)
+            # Evaluate GP at all corners
+            vals_in_corners = self.gpr.predict(corners, validate=False)
+            # Check if at any point it's overshooting
+            higher_than_max = vals_in_corners > self.gpr.y_max
+            if np.sum(higher_than_max) > 0:
+                lines = f"WARNING: found {np.sum(higher_than_max)} corners\n"
+                lines += "where the GP predicts a higher value than its\n"
+                lines += "maximum. Reevaluating those corners..."
+                self.log(lines)
+                # Filter the points where the high values are predicted and
+                # evaluate the posterior distribution there
+                points_to_evaluate = np.atleast_2d(corners[higher_than_max])
+                new_vals = np.empty(len(points_to_evaluate))
+                for i, p in enumerate(points_to_evaluate):
+                    new_vals[i] = self.model.logpost(p)
+                    self.gpr.append_to_data(points_to_evaluate, new_vals,
+                            fit=True)
+                self._share_gpr_from_main()
+                # self.save_checkpoint()
+                self.log("...done.")
+
+    # pylint: disable=import-outside-toplevel
+    def plot_mc(self, surr_info_or_sample_folder, sampler=None, add_training=True,
+                add_samples=None, output=None):
         """
         Creates a triangle plot of an MC sample of the surrogate model, and optionally
         shows some evaluation locations.
@@ -850,7 +1007,7 @@ class Runner(object):
             Whether the training locations are plotted on top of the contours.
 
         add_samples : dict(label, getdist.MCSamples), optional (default=None)
-            Whether the training locations are plotted on top of the contours.
+            Extra getdist.MCSamples objects to be added to the plot.
 
         output : str or os.path, optional (default=None)
             The location to save the generated plot in. If ``None`` it will be saved in
@@ -858,12 +1015,20 @@ class Runner(object):
             ``./images/Surrogate_triangle.png`` if ``checkpoint_path`` is ``None``
         """
         if not is_main_process:
-            return
-        from getdist.mcsamples import MCSamplesFromCobaya
+            return None
+        self.ensure_paths(plots=True)
+        if isinstance(surr_info_or_sample_folder, str):
+            root = os.path.abspath(surr_info_or_sample_folder)
+            if os.path.isdir(root):
+                root += "/"  # to force GetDist to treat it as folder, not prefix
+            from getdist.mcsamples import loadMCSamples
+            gdsamples_gp = loadMCSamples(root)
+        else:  # passed surr_info, sampler
+            gdsamples_gp = sampler.products(
+                to_getdist=True, combined=True, skip_samples=0.33)["sample"]
         import getdist.plots as gdplt
         from gpry.plots import getdist_add_training
         import matplotlib.pyplot as plt
-        gdsamples_gp = MCSamplesFromCobaya(surr_info, sampler.products()["sample"])
         gdplot = gdplt.get_subplot_plotter(width_inch=5)
         to_plot = [gdsamples_gp]
         if add_samples:
@@ -899,7 +1064,8 @@ class Runner(object):
         """
         if not is_main_process:
             return
-        import matplotlib.pyplot as plt
+        self.ensure_paths(plots=True)
+        import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
         mean = sampler.products()["sample"].mean()
         covmat = sampler.products()["sample"].cov()
         fig, ax = plot_distance_distribution(
@@ -918,127 +1084,3 @@ class Runner(object):
         else:
             plt.savefig(output)
         plt.close(fig)
-
-
-def run(model, gpr="RBF", gp_acquisition="LogExp",
-        convergence_criterion="CorrectCounter",
-        callback=None, callback_is_MPI_aware=False,
-        convergence_options=None, options={}, checkpoint=None,
-        load_checkpoint=None, verbose=3):
-    r"""
-    This function is just a wrapper which internally creates a runner instance and runs
-    the bayesian optimization loop. This function will probably be deprecated in a few
-    versions.
-
-    Parameters
-    ----------
-    model : Cobaya `model object <https://cobaya.readthedocs.io/en/latest/cosmo_model.html>`_
-        Contains all information about the parameters in the likelihood and
-        their priors as well as the likelihood itself. Cobaya is only used here
-        as a wrapper to get the logposterior etc.
-
-    gpr : GaussianProcessRegressor, "RBF" or "Matern", optional (default="RBF")
-        The GP used for interpolating the posterior. If None or "RBF" is given
-        a GP with a constant kernel multiplied with an anisotropic RBF kernel
-        and dynamic bounds is generated. The same kernel with a Matern 3/2
-        kernel instead of a RBF is generated if "Matern" is passed. This might
-        be useful if the posterior is not very smooth.
-        Otherwise a custom GP regressor can be created and passed.
-
-    gp_acquisition : GPAcquisition, optional (default="LogExp")
-        The acquisition object. If None is given the LogExp acquisition
-        function is used (with the :math:`\zeta` value chosen automatically
-        depending on the dimensionality of the prior) and the GP's X-values are
-        preprocessed to be in the uniform hypercube before optimizing the
-        acquistion function.
-
-    convergence_criterion : Convergence_criterion, optional (default="KL")
-        The convergence criterion. If None is given the KL-divergence between
-        consecutive runs is calculated with an MCMC run and the run converges
-        if KL<0.02 for two consecutive steps.
-
-    convergence_options: optional parameters passed to the convergence criterion.
-
-    options : dict, optional (default=None)
-        A dict containing all options regarding the bayesian optimization loop.
-        The available options are:
-
-            * n_initial : Number of finite initial truth evaluations before starting the
-              BO loop (default: ``3*number of dimensions``)
-            * max_initial : Maximum number of truth evaluations at initialization. If it
-              is reached before `n_initial` finite points have been found, the run will
-              fail. To avoid that, try decreasing the volume of your prior
-              (default: ``10 * number of dimensions * n_initial``).
-            * n_points_per_acq : Number of points which are aquired with
-              Kriging believer for every acquisition step (default: equals the
-              number of parallel processes)
-            * max_total : Maximum number of attempted sampling points before the run
-              fails. This is useful if you e.g. want to restrict the maximum computation
-              resources (default: ``70 * (number of dimensions)**1.5``).
-            * max_finite : Maximum number of sampling points accepted into the GP training
-              set before the run fails. This might be useful if you use the DontConverge
-              convergence criterion, specifying exactly how many points you want to have
-              in your GP. If you set this limit by hand and find that it is easily
-              saturated, try shrinking your prior boundaries (default: ``max_total``).
-
-    callback: callable, optional (default=None)
-        Function run each iteration after adapting the recently acquired points and
-        the computation of the convergence criterion. This function should take arguments
-        ``callback(runner_instance)``.
-        When running in parallel, the function is run by the main process only.
-
-    callback_is_MPI_aware: bool (default: False)
-        If True, the callback function is called for every process simultaneously, and
-        it is expected to handle parallelisation internally. If false, only the main
-        process calls it.
-
-    checkpoint : str, optional (default=None)
-        Path for storing checkpointing information from which to resume in case the
-        algorithm crashes. If None is given no checkpoint is saved.
-
-    load_checkpoint: "resume" or "overwrite", must be specified if path is not None.
-        Whether to resume from the checkpoint files if existing ones are found
-        at the location specified by ´checkpoint´.
-
-    verbose : 1, 2, 3, optional (default: 3)
-        Level of verbosity. 3 prints Infos, Warnings and Errors, 2
-        Warnings and Errors, and 1 only Errors. Should be set to 2 or 3 if
-        problems arise. Is passed to the GP, Acquisition and Convergence
-        criterion if they are built automatically.
-
-    Returns
-    -------
-    model : Cobaya model
-        The model that was used to run the GP on (if running in parallel, needs to be
-        passed for all processes).
-
-    gpr : GaussianProcessRegressor
-        This can be used to call an MCMC sampler for getting marginalized
-        properties. This is the most crucial component.
-
-    gp_acquisition : GP_acquisition
-        The acquisition object that was used for the active sampling procedure.
-
-    convergence_criterion : Convergence_criterion
-        The convergence criterion used for determining convergence. Depending
-        on the criterion used this also contains the approximate covariance
-        matrix of the posterior distribution which can be used by the MCMC
-        sampler.
-
-    options : dict
-        The options dict used for the active sampling loop.
-
-    progress : Progress
-        Object containing per-iteration progress information: number of finite training
-        points, number of GP evaluations, timing of different parts of the algorithm, and
-        value of the convergence criterion.
-    """
-    runner = Runner(model, gpr=gpr, gp_acquisition=gp_acquisition,
-                    convergence_criterion=convergence_criterion, callback=callback,
-                    callback_is_MPI_aware=callback_is_MPI_aware,
-                    convergence_options=convergence_options, options=options,
-                    checkpoint=checkpoint, load_checkpoint=load_checkpoint,
-                    verbose=verbose)
-    runner.run()
-    return (runner.model, runner.gpr, runner.acquisition, runner.convergence,
-            runner.options, runner.progress)
